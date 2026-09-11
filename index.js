@@ -69,6 +69,98 @@ async function usuarioPublico(row) {
   const { password_hash, ...resto } = row;
   return resto;
 }
+// ── Login de STAFF (veterinario/recepción/propietario dentro de la clínica) ──
+app.post('/api/staff/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    const [rows] = await pool.query(
+      `SELECT s.*, u.nombre_clinica FROM staff s JOIN usuarios u ON u.id=s.cuenta_id WHERE s.email=? LIMIT 1`, [email]
+    );
+    const staff = rows[0];
+    if (!staff || !staff.activo) return res.status(401).json({ ok: false, error: 'Credenciales incorrectas' });
+    const valido = await bcrypt.compare(password, staff.password_hash);
+    if (!valido) return res.status(401).json({ ok: false, error: 'Credenciales incorrectas' });
+    const token = jwt.sign({ id: staff.cuenta_id, staff_id: staff.id, rol_staff: staff.rol, rol: 'cliente' }, JWT_SECRET, { expiresIn: '7d' });
+    const { password_hash, ...staffPublico } = staff;
+    res.json({ ok: true, token, staff: staffPublico });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── Gestión de personal (solo lo crea el propietario/rol cliente principal) ──
+app.get('/api/staff', verificarToken, requireCliente, async (req, res) => {
+  const [rows] = await pool.query('SELECT id, nombre, email, rol, activo FROM staff WHERE cuenta_id=?', [req.user.id]);
+  res.json({ ok: true, staff: rows });
+});
+
+app.post('/api/staff', verificarToken, requireCliente, async (req, res) => {
+  const { nombre, email, password, rol } = req.body || {};
+  if (!nombre || !email || !password || !rol) return res.status(400).json({ ok: false, error: 'Todos los campos son obligatorios' });
+  const hash = await bcrypt.hash(password, 10);
+  const [result] = await pool.query(
+    'INSERT INTO staff (cuenta_id, nombre, email, password_hash, rol) VALUES (?,?,?,?,?)',
+    [req.user.id, nombre, email, hash, rol]
+  );
+  res.json({ ok: true, id: result.insertId });
+});
+
+app.delete('/api/staff/:id', verificarToken, requireCliente, async (req, res) => {
+  await pool.query('DELETE FROM staff WHERE id=? AND cuenta_id=?', [req.params.id, req.user.id]);
+  res.json({ ok: true });
+});
+
+
+// ── ATENCIONES — episodio central del flujo veterinario ──
+app.get('/api/atenciones', verificarToken, requireCliente, async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT a.*, pa.nombre AS paciente_nombre, c.nombre AS cliente_nombre, s.nombre AS staff_nombre
+     FROM atenciones a
+     JOIN pacientes pa ON pa.id=a.paciente_id
+     JOIN clientes c ON c.id=a.cliente_id
+     LEFT JOIN staff s ON s.id=a.staff_id
+     WHERE a.cuenta_id=? AND a.estado != 'cerrada'
+     ORDER BY FIELD(a.prioridad,'emergencia','urgente','prioritario','normal'), a.created_at ASC`,
+    [req.user.id]
+  );
+  res.json({ ok: true, atenciones: rows });
+});
+
+app.post('/api/atenciones', verificarToken, requireCliente, async (req, res) => {
+  const { paciente_id, cliente_id, cita_id, origen, prioridad } = req.body || {};
+  if (!paciente_id || !cliente_id) return res.status(400).json({ ok: false, error: 'Paciente y cliente son obligatorios' });
+  const [result] = await pool.query(
+    `INSERT INTO atenciones (cuenta_id, paciente_id, cliente_id, cita_id, origen, prioridad, estado)
+     VALUES (?,?,?,?,?,?, 'llegada')`,
+    [req.user.id, paciente_id, cliente_id, cita_id || null, origen || 'sin_cita', prioridad || 'normal']
+  );
+  await pool.query(
+    `INSERT INTO auditoria (cuenta_id, atencion_id, accion, modulo) VALUES (?,?,?,?)`,
+    [req.user.id, result.insertId, 'Atención creada', 'atencion']
+  );
+  res.json({ ok: true, id: result.insertId });
+});
+
+app.put('/api/atenciones/:id/estado', verificarToken, requireCliente, async (req, res) => {
+  const { estado } = req.body || {};
+  const estadosValidos = ['llegada','triaje','espera','consulta','diagnostico','tratamiento','venta','seguimiento','cerrada'];
+  if (!estadosValidos.includes(estado)) return res.status(400).json({ ok: false, error: 'Estado inválido' });
+  await pool.query('UPDATE atenciones SET estado=? WHERE id=? AND cuenta_id=?', [estado, req.params.id, req.user.id]);
+  await pool.query(
+    `INSERT INTO auditoria (cuenta_id, atencion_id, accion, modulo) VALUES (?,?,?,?)`,
+    [req.user.id, req.params.id, `Estado cambiado a ${estado}`, 'atencion']
+  );
+  res.json({ ok: true });
+});
+
+// Vincula la historia clínica o venta generada a la atención en curso
+app.put('/api/atenciones/:id/vincular', verificarToken, requireCliente, async (req, res) => {
+  const { historia_id, venta_id } = req.body || {};
+  await pool.query(
+    `UPDATE atenciones SET historia_id=COALESCE(?,historia_id), venta_id=COALESCE(?,venta_id) WHERE id=? AND cuenta_id=?`,
+    [historia_id || null, venta_id || null, req.params.id, req.user.id]
+  );
+  res.json({ ok: true });
+});
+
 
 // ── AUTH ─────────────────────────────────────────────────────
 app.post('/api/auth/login', async (req, res) => {
