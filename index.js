@@ -439,6 +439,9 @@ app.get('/api/historias/:paciente_id', verificarToken, requireCliente, async (re
 });
 
 app.post('/api/historias', verificarToken, requireCliente, async (req, res) => {
+  if (req.user.rol_staff === 'recepcion') {
+    return res.status(403).json({ ok: false, error: 'Recepción no puede registrar diagnósticos ni tratamientos' });
+  }
   const { paciente_id, fecha, motivo, anamnesis, peso, temperatura, fc, fr, diagnostico, tratamiento, recomendaciones, proximo_control } = req.body || {};
   if (!paciente_id || !fecha) return res.status(400).json({ ok: false, error: 'Paciente y fecha son obligatorios' });
   const [result] = await pool.query(
