@@ -69,22 +69,7 @@ async function usuarioPublico(row) {
   const { password_hash, ...resto } = row;
   return resto;
 }
-// ── Login de STAFF (veterinario/recepción/propietario dentro de la clínica) ──
-app.post('/api/staff/login', async (req, res) => {
-  try {
-    const { email, password } = req.body || {};
-    const [rows] = await pool.query(
-      `SELECT s.*, u.nombre_clinica FROM staff s JOIN usuarios u ON u.id=s.cuenta_id WHERE s.email=? LIMIT 1`, [email]
-    );
-    const staff = rows[0];
-    if (!staff || !staff.activo) return res.status(401).json({ ok: false, error: 'Credenciales incorrectas' });
-    const valido = await bcrypt.compare(password, staff.password_hash);
-    if (!valido) return res.status(401).json({ ok: false, error: 'Credenciales incorrectas' });
-    const token = jwt.sign({ id: staff.cuenta_id, staff_id: staff.id, rol_staff: staff.rol, rol: 'cliente' }, JWT_SECRET, { expiresIn: '7d' });
-    const { password_hash, ...staffPublico } = staff;
-    res.json({ ok: true, token, staff: staffPublico });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
+
 
 // ── Gestión de personal (solo lo crea el propietario/rol cliente principal) ──
 app.get('/api/staff', verificarToken, requireCliente, async (req, res) => {
@@ -163,6 +148,7 @@ app.put('/api/atenciones/:id/vincular', verificarToken, requireCliente, async (r
 
 
 // ── AUTH ─────────────────────────────────────────────────────
+// ── AUTH unificado: mismo email, distinta contraseña según el rol ──
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -174,14 +160,37 @@ app.post('/api/auth/login', async (req, res) => {
        WHERE u.email=? LIMIT 1`, [email]
     );
     const usuario = rows[0];
-    if (!usuario) return res.status(401).json({ ok: false, error: 'Credenciales incorrectas' });
-    if (!usuario.activo) return res.status(403).json({ ok: false, error: 'Esta cuenta está desactivada' });
 
-    const valido = await bcrypt.compare(password, usuario.password_hash);
-    if (!valido) return res.status(401).json({ ok: false, error: 'Credenciales incorrectas' });
+    if (usuario) {
+      if (!usuario.activo) return res.status(403).json({ ok: false, error: 'Esta cuenta está desactivada' });
 
-    const token = firmarToken(usuario);
-    res.json({ ok: true, token, usuario: await usuarioPublico(usuario) });
+      // 1) ¿La contraseña es la del propietario/admin?
+      const validoDueno = await bcrypt.compare(password, usuario.password_hash);
+      if (validoDueno) {
+        const token = firmarToken(usuario);
+        return res.json({ ok: true, token, usuario: await usuarioPublico(usuario) });
+      }
+
+      // 2) No es la del dueño: probar contra el personal de ESA MISMA clínica
+      if (usuario.rol === 'cliente') {
+        const [staffRows] = await pool.query('SELECT * FROM staff WHERE cuenta_id=? AND activo=1', [usuario.id]);
+        for (const staff of staffRows) {
+          const okStaff = await bcrypt.compare(password, staff.password_hash);
+          if (okStaff) {
+            const token = jwt.sign(
+              { id: usuario.id, staff_id: staff.id, rol_staff: staff.rol, rol: 'cliente', plan_id: usuario.plan_id },
+              JWT_SECRET, { expiresIn: '7d' }
+            );
+            return res.json({
+              ok: true, token,
+              usuario: { ...(await usuarioPublico(usuario)), rol_staff: staff.rol, staff_nombre: staff.nombre }
+            });
+          }
+        }
+      }
+    }
+
+    return res.status(401).json({ ok: false, error: 'Credenciales incorrectas' });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
