@@ -1,5 +1,6 @@
 // ══════════════════════════════════════════════════════════════
 // VETCORE — Backend API (Node.js + Express + MySQL)
+// Modelo: 1 empresa (clínica) → hasta 3 cuentas (propietario/veterinario/recepcion)
 // ══════════════════════════════════════════════════════════════
 require('dotenv').config();
 const express = require('express');
@@ -37,7 +38,7 @@ app.use(express.json());
 // ── Helpers ──────────────────────────────────────────────────
 function firmarToken(usuario) {
   return jwt.sign(
-    { id: usuario.id, rol: usuario.rol, plan_id: usuario.plan_id },
+    { id: usuario.id, rol: usuario.rol, empresa_id: usuario.empresa_id },
     JWT_SECRET,
     { expiresIn: '7d' }
   );
@@ -60,9 +61,20 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-function requireCliente(req, res, next) {
-  if (req.user.rol !== 'cliente') return res.status(403).json({ ok: false, error: 'Solo cuentas de clínica pueden hacer esto' });
+// Cualquiera de las 3 cuentas de una empresa (propietario/veterinario/recepcion)
+function requireEmpresa(req, res, next) {
+  if (!req.user.empresa_id) return res.status(403).json({ ok: false, error: 'Esta cuenta no pertenece a ninguna clínica' });
   next();
+}
+
+// Restringe a roles específicos dentro de una empresa. Uso: requireRoles('propietario','recepcion')
+function requireRoles(...rolesPermitidos) {
+  return (req, res, next) => {
+    if (!rolesPermitidos.includes(req.user.rol)) {
+      return res.status(403).json({ ok: false, error: 'Tu rol no tiene acceso a esta función' });
+    }
+    next();
+  };
 }
 
 async function usuarioPublico(row) {
@@ -70,127 +82,30 @@ async function usuarioPublico(row) {
   return resto;
 }
 
-
-// ── Gestión de personal (solo lo crea el propietario/rol cliente principal) ──
-app.get('/api/staff', verificarToken, requireCliente, async (req, res) => {
-  const [rows] = await pool.query('SELECT id, nombre, email, rol, activo FROM staff WHERE cuenta_id=?', [req.user.id]);
-  res.json({ ok: true, staff: rows });
-});
-
-app.post('/api/staff', verificarToken, requireCliente, async (req, res) => {
-  const { nombre, email, password, rol } = req.body || {};
-  if (!nombre || !email || !password || !rol) return res.status(400).json({ ok: false, error: 'Todos los campos son obligatorios' });
-  const hash = await bcrypt.hash(password, 10);
-  const [result] = await pool.query(
-    'INSERT INTO staff (cuenta_id, nombre, email, password_hash, rol) VALUES (?,?,?,?,?)',
-    [req.user.id, nombre, email, hash, rol]
-  );
-  res.json({ ok: true, id: result.insertId });
-});
-
-app.delete('/api/staff/:id', verificarToken, requireCliente, async (req, res) => {
-  await pool.query('DELETE FROM staff WHERE id=? AND cuenta_id=?', [req.params.id, req.user.id]);
-  res.json({ ok: true });
-});
-
-
-// ── ATENCIONES — episodio central del flujo veterinario ──
-app.get('/api/atenciones', verificarToken, requireCliente, async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT a.*, pa.nombre AS paciente_nombre, c.nombre AS cliente_nombre, s.nombre AS staff_nombre
-     FROM atenciones a
-     JOIN pacientes pa ON pa.id=a.paciente_id
-     JOIN clientes c ON c.id=a.cliente_id
-     LEFT JOIN staff s ON s.id=a.staff_id
-     WHERE a.cuenta_id=? AND a.estado != 'cerrada'
-     ORDER BY FIELD(a.prioridad,'emergencia','urgente','prioritario','normal'), a.created_at ASC`,
-    [req.user.id]
-  );
-  res.json({ ok: true, atenciones: rows });
-});
-
-app.post('/api/atenciones', verificarToken, requireCliente, async (req, res) => {
-  const { paciente_id, cliente_id, cita_id, origen, prioridad } = req.body || {};
-  if (!paciente_id || !cliente_id) return res.status(400).json({ ok: false, error: 'Paciente y cliente son obligatorios' });
-  const [result] = await pool.query(
-    `INSERT INTO atenciones (cuenta_id, paciente_id, cliente_id, cita_id, origen, prioridad, estado)
-     VALUES (?,?,?,?,?,?, 'llegada')`,
-    [req.user.id, paciente_id, cliente_id, cita_id || null, origen || 'sin_cita', prioridad || 'normal']
-  );
-  await pool.query(
-    `INSERT INTO auditoria (cuenta_id, atencion_id, accion, modulo) VALUES (?,?,?,?)`,
-    [req.user.id, result.insertId, 'Atención creada', 'atencion']
-  );
-  res.json({ ok: true, id: result.insertId });
-});
-
-app.put('/api/atenciones/:id/estado', verificarToken, requireCliente, async (req, res) => {
-  const { estado } = req.body || {};
-  const estadosValidos = ['llegada','triaje','espera','consulta','diagnostico','tratamiento','venta','seguimiento','cerrada'];
-  if (!estadosValidos.includes(estado)) return res.status(400).json({ ok: false, error: 'Estado inválido' });
-  await pool.query('UPDATE atenciones SET estado=? WHERE id=? AND cuenta_id=?', [estado, req.params.id, req.user.id]);
-  await pool.query(
-    `INSERT INTO auditoria (cuenta_id, atencion_id, accion, modulo) VALUES (?,?,?,?)`,
-    [req.user.id, req.params.id, `Estado cambiado a ${estado}`, 'atencion']
-  );
-  res.json({ ok: true });
-});
-
-// Vincula la historia clínica o venta generada a la atención en curso
-app.put('/api/atenciones/:id/vincular', verificarToken, requireCliente, async (req, res) => {
-  const { historia_id, venta_id } = req.body || {};
-  await pool.query(
-    `UPDATE atenciones SET historia_id=COALESCE(?,historia_id), venta_id=COALESCE(?,venta_id) WHERE id=? AND cuenta_id=?`,
-    [historia_id || null, venta_id || null, req.params.id, req.user.id]
-  );
-  res.json({ ok: true });
-});
-
-
 // ── AUTH ─────────────────────────────────────────────────────
-// ── AUTH unificado: mismo email, distinta contraseña según el rol ──
+// Login único: cada cuenta (admin, propietario, veterinario, recepcion) tiene su propio email+password
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ ok: false, error: 'Email y contraseña requeridos' });
 
     const [rows] = await pool.query(
-      `SELECT u.*, p.codigo AS plan_codigo, p.nombre AS plan_nombre, p.modulos AS plan_modulos
-       FROM usuarios u LEFT JOIN planes p ON p.id = u.plan_id
+      `SELECT u.*, e.nombre_clinica, e.activo AS empresa_activa, p.nombre AS plan_nombre, p.modulos AS plan_modulos
+       FROM usuarios u
+       LEFT JOIN empresas e ON e.id = u.empresa_id
+       LEFT JOIN planes p ON p.id = e.plan_id
        WHERE u.email=? LIMIT 1`, [email]
     );
     const usuario = rows[0];
+    if (!usuario) return res.status(401).json({ ok: false, error: 'Credenciales incorrectas' });
+    if (!usuario.activo) return res.status(403).json({ ok: false, error: 'Esta cuenta está desactivada' });
+    if (usuario.empresa_id && !usuario.empresa_activa) return res.status(403).json({ ok: false, error: 'La clínica está desactivada' });
 
-    if (usuario) {
-      if (!usuario.activo) return res.status(403).json({ ok: false, error: 'Esta cuenta está desactivada' });
+    const valido = await bcrypt.compare(password, usuario.password_hash);
+    if (!valido) return res.status(401).json({ ok: false, error: 'Credenciales incorrectas' });
 
-      // 1) ¿La contraseña es la del propietario/admin?
-      const validoDueno = await bcrypt.compare(password, usuario.password_hash);
-      if (validoDueno) {
-        const token = firmarToken(usuario);
-        return res.json({ ok: true, token, usuario: await usuarioPublico(usuario) });
-      }
-
-      // 2) No es la del dueño: probar contra el personal de ESA MISMA clínica
-      if (usuario.rol === 'cliente') {
-        const [staffRows] = await pool.query('SELECT * FROM staff WHERE cuenta_id=? AND activo=1', [usuario.id]);
-        for (const staff of staffRows) {
-          const okStaff = await bcrypt.compare(password, staff.password_hash);
-          if (okStaff) {
-            const token = jwt.sign(
-              { id: usuario.id, staff_id: staff.id, rol_staff: staff.rol, rol: 'cliente', plan_id: usuario.plan_id },
-              JWT_SECRET, { expiresIn: '7d' }
-            );
-            return res.json({
-              ok: true, token,
-              usuario: { ...(await usuarioPublico(usuario)), rol_staff: staff.rol, staff_nombre: staff.nombre }
-            });
-          }
-        }
-      }
-    }
-
-    return res.status(401).json({ ok: false, error: 'Credenciales incorrectas' });
+    const token = firmarToken(usuario);
+    res.json({ ok: true, token, usuario: await usuarioPublico(usuario) });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -198,8 +113,10 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/auth/me', verificarToken, async (req, res) => {
   const [rows] = await pool.query(
-    `SELECT u.*, p.codigo AS plan_codigo, p.nombre AS plan_nombre, p.modulos AS plan_modulos
-     FROM usuarios u LEFT JOIN planes p ON p.id = u.plan_id
+    `SELECT u.*, e.nombre_clinica, p.nombre AS plan_nombre, p.modulos AS plan_modulos
+     FROM usuarios u
+     LEFT JOIN empresas e ON e.id = u.empresa_id
+     LEFT JOIN planes p ON p.id = e.plan_id
      WHERE u.id=? LIMIT 1`, [req.user.id]
   );
   if (!rows[0]) return res.status(404).json({ ok: false, error: 'No encontrado' });
@@ -213,32 +130,94 @@ app.get('/api/planes', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
-// ADMIN — gestión de cuentas de clínicas (clientes de Vetcore)
+// ADMIN — gestión de empresas (clínicas) y sus 3 cuentas de rol
 // ══════════════════════════════════════════════════════════════
-app.get('/api/admin/cuentas', verificarToken, requireAdmin, async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT u.id, u.nombre_clinica, u.nombre, u.email, u.telefono, u.activo, u.created_at,
-            p.id AS plan_id, p.codigo AS plan_codigo, p.nombre AS plan_nombre, p.precio AS plan_precio
-     FROM usuarios u LEFT JOIN planes p ON p.id = u.plan_id
-     WHERE u.rol='cliente' ORDER BY u.id DESC`
+
+// Lista empresas con sus cuentas asociadas
+app.get('/api/admin/empresas', verificarToken, requireAdmin, async (req, res) => {
+  const [empresas] = await pool.query(
+    `SELECT e.*, p.nombre AS plan_nombre, p.precio AS plan_precio
+     FROM empresas e LEFT JOIN planes p ON p.id = e.plan_id
+     ORDER BY e.id DESC`
   );
-  res.json({ ok: true, cuentas: rows });
+  const [cuentas] = await pool.query(
+    `SELECT id, empresa_id, rol, nombre, email, activo FROM usuarios WHERE empresa_id IS NOT NULL`
+  );
+  const porEmpresa = empresas.map(e => ({
+    ...e,
+    cuentas: cuentas.filter(c => c.empresa_id === e.id)
+  }));
+  res.json({ ok: true, empresas: porEmpresa });
 });
 
-app.post('/api/admin/cuentas', verificarToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/stats', verificarToken, requireAdmin, async (req, res) => {
+  const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM empresas`);
+  const [[{ activas }]] = await pool.query(`SELECT COUNT(*) AS activas FROM empresas WHERE activo=1`);
+  const [porPlan] = await pool.query(
+    `SELECT p.nombre AS plan, COUNT(*) AS total, SUM(p.precio) AS ingreso_mensual
+     FROM empresas e JOIN planes p ON p.id=e.plan_id
+     WHERE e.activo=1 GROUP BY p.id`
+  );
+  res.json({ ok: true, total, activas, porPlan });
+});
+
+// Crea una empresa nueva + su cuenta de propietario (obligatoria) + veterinario/recepcion (opcionales)
+app.post('/api/admin/empresas', verificarToken, requireAdmin, async (req, res) => {
+  const conn = await pool.getConnection();
   try {
-    const { nombre_clinica, nombre, email, telefono, password, plan_id } = req.body || {};
-    if (!nombre_clinica || !email || !password || !plan_id) {
-      return res.status(400).json({ ok: false, error: 'Nombre de clínica, email, contraseña y plan son obligatorios' });
+    const { nombre_clinica, plan_id, propietario, veterinario, recepcion } = req.body || {};
+    if (!nombre_clinica || !plan_id || !propietario?.email || !propietario?.password) {
+      return res.status(400).json({ ok: false, error: 'Nombre de clínica, plan y los datos del propietario son obligatorios' });
     }
+
+    const emails = [propietario, veterinario, recepcion].filter(Boolean).map(c => c.email);
+    const [dupes] = await conn.query('SELECT email FROM usuarios WHERE email IN (?)', [emails]);
+    if (dupes.length) return res.status(400).json({ ok: false, error: `Email ya registrado: ${dupes[0].email}` });
+
+    await conn.beginTransaction();
+
+    const [empresaResult] = await conn.query(
+      'INSERT INTO empresas (nombre_clinica, plan_id, activo) VALUES (?,?,1)',
+      [nombre_clinica, plan_id]
+    );
+    const empresaId = empresaResult.insertId;
+
+    async function crearCuenta(datos, rol) {
+      if (!datos?.email || !datos?.password) return null;
+      const hash = await bcrypt.hash(datos.password, 10);
+      const [r] = await conn.query(
+        'INSERT INTO usuarios (empresa_id, rol, nombre, email, telefono, password_hash, activo) VALUES (?,?,?,?,?,?,1)',
+        [empresaId, rol, datos.nombre || '', datos.email, datos.telefono || '', hash]
+      );
+      return r.insertId;
+    }
+
+    const propietarioId = await crearCuenta(propietario, 'propietario');
+    const veterinarioId = await crearCuenta(veterinario, 'veterinario');
+    const recepcionId = await crearCuenta(recepcion, 'recepcion');
+
+    await conn.commit();
+    res.json({ ok: true, empresa_id: empresaId, propietario_id: propietarioId, veterinario_id: veterinarioId, recepcion_id: recepcionId });
+  } catch (e) {
+    await conn.rollback();
+    res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// Agrega una cuenta suelta a una empresa que ya existe (p. ej. contratan un veterinario después)
+app.post('/api/admin/empresas/:id/cuentas', verificarToken, requireAdmin, async (req, res) => {
+  try {
+    const { rol, nombre, email, telefono, password } = req.body || {};
+    if (!['propietario', 'veterinario', 'recepcion'].includes(rol)) return res.status(400).json({ ok: false, error: 'Rol inválido' });
+    if (!email || !password) return res.status(400).json({ ok: false, error: 'Email y contraseña son obligatorios' });
     const [existe] = await pool.query('SELECT id FROM usuarios WHERE email=?', [email]);
     if (existe.length) return res.status(400).json({ ok: false, error: 'Ese email ya está registrado' });
-
     const hash = await bcrypt.hash(password, 10);
     const [result] = await pool.query(
-      `INSERT INTO usuarios (rol, nombre_clinica, nombre, email, telefono, password_hash, plan_id, activo)
-       VALUES ('cliente', ?, ?, ?, ?, ?, ?, 1)`,
-      [nombre_clinica, nombre || '', email, telefono || '', hash, plan_id]
+      'INSERT INTO usuarios (empresa_id, rol, nombre, email, telefono, password_hash, activo) VALUES (?,?,?,?,?,?,1)',
+      [req.params.id, rol, nombre || '', email, telefono || '', hash]
     );
     res.json({ ok: true, id: result.insertId });
   } catch (e) {
@@ -246,300 +225,326 @@ app.post('/api/admin/cuentas', verificarToken, requireAdmin, async (req, res) =>
   }
 });
 
+// Edita una cuenta de rol (nombre, teléfono, contraseña, activar/desactivar)
 app.put('/api/admin/cuentas/:id', verificarToken, requireAdmin, async (req, res) => {
-  try {
-    const { nombre_clinica, nombre, telefono, plan_id, activo, password } = req.body || {};
-    await pool.query(
-      `UPDATE usuarios SET
-         nombre_clinica = COALESCE(?, nombre_clinica),
-         nombre = COALESCE(?, nombre),
-         telefono = COALESCE(?, telefono),
-         plan_id = COALESCE(?, plan_id),
-         activo = COALESCE(?, activo)
-       WHERE id=? AND rol='cliente'`,
-      [nombre_clinica ?? null, nombre ?? null, telefono ?? null, plan_id ?? null,
-       (activo === undefined ? null : activo), req.params.id]
-    );
-    if (password) {
-      const hash = await bcrypt.hash(password, 10);
-      await pool.query('UPDATE usuarios SET password_hash=? WHERE id=?', [hash, req.params.id]);
-    }
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+  const { nombre, telefono, activo, password } = req.body || {};
+  await pool.query(
+    `UPDATE usuarios SET
+       nombre = COALESCE(?, nombre), telefono = COALESCE(?, telefono), activo = COALESCE(?, activo)
+     WHERE id=? AND rol != 'admin'`,
+    [nombre ?? null, telefono ?? null, (activo === undefined ? null : activo), req.params.id]
+  );
+  if (password) {
+    const hash = await bcrypt.hash(password, 10);
+    await pool.query('UPDATE usuarios SET password_hash=? WHERE id=?', [hash, req.params.id]);
   }
-});
-
-app.delete('/api/admin/cuentas/:id', verificarToken, requireAdmin, async (req, res) => {
-  await pool.query(`DELETE FROM usuarios WHERE id=? AND rol='cliente'`, [req.params.id]);
   res.json({ ok: true });
 });
 
-app.get('/api/admin/stats', verificarToken, requireAdmin, async (req, res) => {
-  const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM usuarios WHERE rol='cliente'`);
-  const [[{ activas }]] = await pool.query(`SELECT COUNT(*) AS activas FROM usuarios WHERE rol='cliente' AND activo=1`);
-  const [porPlan] = await pool.query(
-    `SELECT p.nombre AS plan, COUNT(*) AS total, SUM(p.precio) AS ingreso_mensual
-     FROM usuarios u JOIN planes p ON p.id=u.plan_id
-     WHERE u.rol='cliente' AND u.activo=1 GROUP BY p.id`
+app.delete('/api/admin/cuentas/:id', verificarToken, requireAdmin, async (req, res) => {
+  await pool.query(`DELETE FROM usuarios WHERE id=? AND rol != 'admin'`, [req.params.id]);
+  res.json({ ok: true });
+});
+
+app.put('/api/admin/empresas/:id', verificarToken, requireAdmin, async (req, res) => {
+  const { nombre_clinica, plan_id, activo } = req.body || {};
+  await pool.query(
+    `UPDATE empresas SET
+       nombre_clinica = COALESCE(?, nombre_clinica), plan_id = COALESCE(?, plan_id), activo = COALESCE(?, activo)
+     WHERE id=?`,
+    [nombre_clinica ?? null, plan_id ?? null, (activo === undefined ? null : activo), req.params.id]
   );
-  res.json({ ok: true, total, activas, porPlan });
+  res.json({ ok: true });
+});
+
+app.delete('/api/admin/empresas/:id', verificarToken, requireAdmin, async (req, res) => {
+  // Borra la empresa; las cuentas quedan huérfanas por FK, así que primero se eliminan
+  await pool.query('DELETE FROM usuarios WHERE empresa_id=?', [req.params.id]);
+  await pool.query('DELETE FROM empresas WHERE id=?', [req.params.id]);
+  res.json({ ok: true });
 });
 
 // ══════════════════════════════════════════════════════════════
-// CLIENTE (clínica) — módulos del plan Starter
-// Todo queda aislado por cuenta_id = req.user.id
+// ATENCIONES — episodio central del flujo veterinario (los 3 roles)
 // ══════════════════════════════════════════════════════════════
-
-// ── Clientes (propietarios de mascotas) ────────────────────────
-app.get('/api/clientes', verificarToken, requireCliente, async (req, res) => {
-  const [rows] = await pool.query('SELECT * FROM clientes WHERE cuenta_id=? ORDER BY id DESC', [req.user.id]);
-  res.json({ ok: true, clientes: rows });
+app.get('/api/atenciones', verificarToken, requireEmpresa, async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT a.*, pa.nombre AS paciente_nombre, c.nombre AS cliente_nombre, u.nombre AS staff_nombre
+     FROM atenciones a
+     JOIN pacientes pa ON pa.id=a.paciente_id
+     JOIN clientes c ON c.id=a.cliente_id
+     LEFT JOIN usuarios u ON u.id=a.staff_id
+     WHERE a.empresa_id=? AND a.estado != 'cerrada'
+     ORDER BY FIELD(a.prioridad,'emergencia','urgente','prioritario','normal'), a.created_at ASC`,
+    [req.user.empresa_id]
+  );
+  res.json({ ok: true, atenciones: rows });
 });
 
-app.post('/api/clientes', verificarToken, requireCliente, async (req, res) => {
-  const { nombre, telefono, email, direccion, documento } = req.body || {};
-  if (!nombre) return res.status(400).json({ ok: false, error: 'El nombre es obligatorio' });
+app.post('/api/atenciones', verificarToken, requireEmpresa, async (req, res) => {
+  const { paciente_id, cliente_id, cita_id, origen, prioridad } = req.body || {};
+  if (!paciente_id || !cliente_id) return res.status(400).json({ ok: false, error: 'Paciente y cliente son obligatorios' });
   const [result] = await pool.query(
-    `INSERT INTO clientes (cuenta_id, nombre, telefono, email, direccion, documento)
-     VALUES (?,?,?,?,?,?)`,
-    [req.user.id, nombre, telefono || '', email || '', direccion || '', documento || '']
+    `INSERT INTO atenciones (empresa_id, staff_id, paciente_id, cliente_id, cita_id, origen, prioridad, estado)
+     VALUES (?,?,?,?,?,?,?, 'llegada')`,
+    [req.user.empresa_id, req.user.id, paciente_id, cliente_id, cita_id || null, origen || 'sin_cita', prioridad || 'normal']
   );
   res.json({ ok: true, id: result.insertId });
 });
 
-app.put('/api/clientes/:id', verificarToken, requireCliente, async (req, res) => {
-  const { nombre, telefono, email, direccion, documento } = req.body || {};
+app.put('/api/atenciones/:id/estado', verificarToken, requireEmpresa, async (req, res) => {
+  const { estado } = req.body || {};
+  const estadosValidos = ['llegada','triaje','espera','consulta','diagnostico','tratamiento','venta','seguimiento','cerrada'];
+  if (!estadosValidos.includes(estado)) return res.status(400).json({ ok: false, error: 'Estado inválido' });
+  await pool.query('UPDATE atenciones SET estado=? WHERE id=? AND empresa_id=?', [estado, req.params.id, req.user.empresa_id]);
+  res.json({ ok: true });
+});
+
+app.put('/api/atenciones/:id/vincular', verificarToken, requireEmpresa, async (req, res) => {
+  const { historia_id, venta_id } = req.body || {};
   await pool.query(
-    `UPDATE clientes SET nombre=?, telefono=?, email=?, direccion=?, documento=?
-     WHERE id=? AND cuenta_id=?`,
-    [nombre, telefono || '', email || '', direccion || '', documento || '', req.params.id, req.user.id]
+    `UPDATE atenciones SET historia_id=COALESCE(?,historia_id), venta_id=COALESCE(?,venta_id) WHERE id=? AND empresa_id=?`,
+    [historia_id || null, venta_id || null, req.params.id, req.user.empresa_id]
   );
   res.json({ ok: true });
 });
 
-app.delete('/api/clientes/:id', verificarToken, requireCliente, async (req, res) => {
-  await pool.query('DELETE FROM clientes WHERE id=? AND cuenta_id=?', [req.params.id, req.user.id]);
+// ══════════════════════════════════════════════════════════════
+// CLIENTES (propietarios de mascotas) — propietario y recepción
+// ══════════════════════════════════════════════════════════════
+app.get('/api/clientes', verificarToken, requireEmpresa, async (req, res) => {
+  const [rows] = await pool.query('SELECT * FROM clientes WHERE empresa_id=? ORDER BY id DESC', [req.user.empresa_id]);
+  res.json({ ok: true, clientes: rows });
+});
+
+app.post('/api/clientes', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
+  const { nombre, telefono, email, direccion, documento } = req.body || {};
+  if (!nombre) return res.status(400).json({ ok: false, error: 'El nombre es obligatorio' });
+  const [result] = await pool.query(
+    `INSERT INTO clientes (empresa_id, nombre, telefono, email, direccion, documento) VALUES (?,?,?,?,?,?)`,
+    [req.user.empresa_id, nombre, telefono || '', email || '', direccion || '', documento || '']
+  );
+  res.json({ ok: true, id: result.insertId });
+});
+
+app.put('/api/clientes/:id', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
+  const { nombre, telefono, email, direccion, documento } = req.body || {};
+  await pool.query(
+    `UPDATE clientes SET nombre=?, telefono=?, email=?, direccion=?, documento=? WHERE id=? AND empresa_id=?`,
+    [nombre, telefono || '', email || '', direccion || '', documento || '', req.params.id, req.user.empresa_id]
+  );
   res.json({ ok: true });
 });
 
-// ── Pacientes (mascotas) ────────────────────────────────────────
-app.get('/api/pacientes', verificarToken, requireCliente, async (req, res) => {
+app.delete('/api/clientes/:id', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
+  await pool.query('DELETE FROM clientes WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
+  res.json({ ok: true });
+});
+
+// ══════════════════════════════════════════════════════════════
+// PACIENTES (mascotas) — los 3 roles leen; propietario y recepción escriben
+// ══════════════════════════════════════════════════════════════
+app.get('/api/pacientes', verificarToken, requireEmpresa, async (req, res) => {
   const [rows] = await pool.query(
     `SELECT pa.*, c.nombre AS cliente_nombre, c.telefono AS cliente_telefono
      FROM pacientes pa JOIN clientes c ON c.id = pa.cliente_id
-     WHERE pa.cuenta_id=? ORDER BY pa.id DESC`, [req.user.id]
+     WHERE pa.empresa_id=? ORDER BY pa.id DESC`, [req.user.empresa_id]
   );
   res.json({ ok: true, pacientes: rows });
 });
 
-// ── Subir foto de mascota ──────────────────────────────────────
-app.post('/api/pacientes/:id/foto', verificarToken, requireCliente, upload.single('foto'), async (req, res) => {
+app.post('/api/pacientes/:id/foto', verificarToken, requireEmpresa, upload.single('foto'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió ninguna imagen' });
     const result = await subirACloudinary(req.file.buffer, 'vetcore/pacientes');
-    await pool.query(
-      'UPDATE pacientes SET foto_url=? WHERE id=? AND cuenta_id=?',
-      [result.secure_url, req.params.id, req.user.id]
-    );
+    await pool.query('UPDATE pacientes SET foto_url=? WHERE id=? AND empresa_id=?', [result.secure_url, req.params.id, req.user.empresa_id]);
     res.json({ ok: true, foto_url: result.secure_url });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-app.post('/api/pacientes', verificarToken, requireCliente, async (req, res) => {
+app.post('/api/pacientes', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
   const { cliente_id, nombre, especie, raza, sexo, fecha_nacimiento, peso, color, microchip, alergias, observaciones } = req.body || {};
   if (!cliente_id || !nombre) return res.status(400).json({ ok: false, error: 'Propietario y nombre de la mascota son obligatorios' });
   const [result] = await pool.query(
-    `INSERT INTO pacientes (cuenta_id, cliente_id, nombre, especie, raza, sexo, fecha_nacimiento, peso, color, microchip, alergias, observaciones)
+    `INSERT INTO pacientes (empresa_id, cliente_id, nombre, especie, raza, sexo, fecha_nacimiento, peso, color, microchip, alergias, observaciones)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [req.user.id, cliente_id, nombre, especie || '', raza || '', sexo || '', fecha_nacimiento || null,
+    [req.user.empresa_id, cliente_id, nombre, especie || '', raza || '', sexo || '', fecha_nacimiento || null,
      peso || null, color || '', microchip || '', alergias || '', observaciones || '']
   );
   res.json({ ok: true, id: result.insertId });
 });
 
-app.put('/api/pacientes/:id', verificarToken, requireCliente, async (req, res) => {
+app.put('/api/pacientes/:id', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
   const { nombre, especie, raza, sexo, fecha_nacimiento, peso, color, microchip, alergias, observaciones } = req.body || {};
   await pool.query(
     `UPDATE pacientes SET nombre=?, especie=?, raza=?, sexo=?, fecha_nacimiento=?, peso=?, color=?, microchip=?, alergias=?, observaciones=?
-     WHERE id=? AND cuenta_id=?`,
+     WHERE id=? AND empresa_id=?`,
     [nombre, especie || '', raza || '', sexo || '', fecha_nacimiento || null, peso || null,
-     color || '', microchip || '', alergias || '', observaciones || '', req.params.id, req.user.id]
+     color || '', microchip || '', alergias || '', observaciones || '', req.params.id, req.user.empresa_id]
   );
   res.json({ ok: true });
 });
 
-app.delete('/api/pacientes/:id', verificarToken, requireCliente, async (req, res) => {
-  await pool.query('DELETE FROM pacientes WHERE id=? AND cuenta_id=?', [req.params.id, req.user.id]);
+app.delete('/api/pacientes/:id', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
+  await pool.query('DELETE FROM pacientes WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
   res.json({ ok: true });
 });
 
-// ── Agenda (citas) ───────────────────────────────────────────
-app.get('/api/citas', verificarToken, requireCliente, async (req, res) => {
+// ══════════════════════════════════════════════════════════════
+// AGENDA (citas) — propietario y recepción escriben, veterinario solo lee
+// ══════════════════════════════════════════════════════════════
+app.get('/api/citas', verificarToken, requireEmpresa, async (req, res) => {
   const [rows] = await pool.query(
     `SELECT ci.*, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre
      FROM citas ci
      LEFT JOIN clientes c ON c.id = ci.cliente_id
      LEFT JOIN pacientes pa ON pa.id = ci.paciente_id
-     WHERE ci.cuenta_id=? ORDER BY ci.fecha ASC, ci.hora ASC`, [req.user.id]
+     WHERE ci.empresa_id=? ORDER BY ci.fecha ASC, ci.hora ASC`, [req.user.empresa_id]
   );
   res.json({ ok: true, citas: rows });
 });
 
-app.post('/api/citas', verificarToken, requireCliente, async (req, res) => {
+app.post('/api/citas', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
   const { cliente_id, paciente_id, fecha, hora, motivo, notas } = req.body || {};
   if (!fecha) return res.status(400).json({ ok: false, error: 'La fecha es obligatoria' });
   const [result] = await pool.query(
-    `INSERT INTO citas (cuenta_id, cliente_id, paciente_id, fecha, hora, motivo, notas)
-     VALUES (?,?,?,?,?,?,?)`,
-    [req.user.id, cliente_id || null, paciente_id || null, fecha, hora || null, motivo || '', notas || '']
+    `INSERT INTO citas (empresa_id, cliente_id, paciente_id, fecha, hora, motivo, notas) VALUES (?,?,?,?,?,?,?)`,
+    [req.user.empresa_id, cliente_id || null, paciente_id || null, fecha, hora || null, motivo || '', notas || '']
   );
   res.json({ ok: true, id: result.insertId });
 });
 
-app.put('/api/citas/:id', verificarToken, requireCliente, async (req, res) => {
+app.put('/api/citas/:id', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
   const { fecha, hora, motivo, notas, estado } = req.body || {};
   await pool.query(
-    `UPDATE citas SET
-       fecha = COALESCE(?, fecha), hora = COALESCE(?, hora),
-       motivo = COALESCE(?, motivo), notas = COALESCE(?, notas),
-       estado = COALESCE(?, estado)
-     WHERE id=? AND cuenta_id=?`,
-    [fecha ?? null, hora ?? null, motivo ?? null, notas ?? null, estado ?? null, req.params.id, req.user.id]
+    `UPDATE citas SET fecha=COALESCE(?,fecha), hora=COALESCE(?,hora), motivo=COALESCE(?,motivo), notas=COALESCE(?,notas), estado=COALESCE(?,estado)
+     WHERE id=? AND empresa_id=?`,
+    [fecha ?? null, hora ?? null, motivo ?? null, notas ?? null, estado ?? null, req.params.id, req.user.empresa_id]
   );
   res.json({ ok: true });
 });
 
-app.delete('/api/citas/:id', verificarToken, requireCliente, async (req, res) => {
-  await pool.query('DELETE FROM citas WHERE id=? AND cuenta_id=?', [req.params.id, req.user.id]);
+app.delete('/api/citas/:id', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
+  await pool.query('DELETE FROM citas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
   res.json({ ok: true });
 });
 
-
-
-
-// ── Búsqueda global (paciente, tutor, teléfono) ────────────────
-app.get('/api/buscar', verificarToken, requireCliente, async (req, res) => {
+// ── Búsqueda global ─────────────────────────────────────────
+app.get('/api/buscar', verificarToken, requireEmpresa, async (req, res) => {
   const term = (req.query.q || '').trim();
   if (!term) return res.json({ ok: true, clientes: [], pacientes: [] });
   const like = `%${term}%`;
   const [clientes] = await pool.query(
-    `SELECT id, nombre, telefono FROM clientes WHERE cuenta_id=? AND (nombre LIKE ? OR telefono LIKE ?) LIMIT 6`,
-    [req.user.id, like, like]
+    `SELECT id, nombre, telefono FROM clientes WHERE empresa_id=? AND (nombre LIKE ? OR telefono LIKE ?) LIMIT 6`,
+    [req.user.empresa_id, like, like]
   );
   const [pacientes] = await pool.query(
     `SELECT pa.id, pa.nombre, pa.especie, c.nombre AS cliente_nombre
      FROM pacientes pa JOIN clientes c ON c.id = pa.cliente_id
-     WHERE pa.cuenta_id=? AND pa.nombre LIKE ? LIMIT 6`,
-    [req.user.id, like]
+     WHERE pa.empresa_id=? AND pa.nombre LIKE ? LIMIT 6`,
+    [req.user.empresa_id, like]
   );
   res.json({ ok: true, clientes, pacientes });
 });
 
-// ── Historia clínica (consultas) ───────────────────────────────
-app.get('/api/historias/:paciente_id', verificarToken, requireCliente, async (req, res) => {
+// ══════════════════════════════════════════════════════════════
+// HISTORIA CLÍNICA — propietario y veterinario (recepción NO)
+// ══════════════════════════════════════════════════════════════
+app.get('/api/historias/:paciente_id', verificarToken, requireRoles('propietario', 'veterinario'), async (req, res) => {
   const [rows] = await pool.query(
-    `SELECT * FROM historias WHERE paciente_id=? AND cuenta_id=? ORDER BY fecha DESC, id DESC`,
-    [req.params.paciente_id, req.user.id]
+    `SELECT * FROM historias WHERE paciente_id=? AND empresa_id=? ORDER BY fecha DESC, id DESC`,
+    [req.params.paciente_id, req.user.empresa_id]
   );
   res.json({ ok: true, historias: rows });
 });
 
-app.post('/api/historias', verificarToken, requireCliente, async (req, res) => {
-  if (req.user.rol_staff === 'recepcion') {
-    return res.status(403).json({ ok: false, error: 'Recepción no puede registrar diagnósticos ni tratamientos' });
-  }
+app.post('/api/historias', verificarToken, requireRoles('propietario', 'veterinario'), async (req, res) => {
   const { paciente_id, fecha, motivo, anamnesis, peso, temperatura, fc, fr, diagnostico, tratamiento, recomendaciones, proximo_control } = req.body || {};
   if (!paciente_id || !fecha) return res.status(400).json({ ok: false, error: 'Paciente y fecha son obligatorios' });
   const [result] = await pool.query(
-    `INSERT INTO historias (cuenta_id, paciente_id, fecha, motivo, anamnesis, peso, temperatura, fc, fr, diagnostico, tratamiento, recomendaciones, proximo_control)
+    `INSERT INTO historias (empresa_id, paciente_id, fecha, motivo, anamnesis, peso, temperatura, fc, fr, diagnostico, tratamiento, recomendaciones, proximo_control)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [req.user.id, paciente_id, fecha, motivo || '', anamnesis || '', peso || null, temperatura || null,
+    [req.user.empresa_id, paciente_id, fecha, motivo || '', anamnesis || '', peso || null, temperatura || null,
      fc || '', fr || '', diagnostico || '', tratamiento || '', recomendaciones || '', proximo_control || null]
   );
   res.json({ ok: true, id: result.insertId });
 });
 
-app.delete('/api/historias/:id', verificarToken, requireCliente, async (req, res) => {
-  await pool.query('DELETE FROM historias WHERE id=? AND cuenta_id=?', [req.params.id, req.user.id]);
+app.delete('/api/historias/:id', verificarToken, requireRoles('propietario', 'veterinario'), async (req, res) => {
+  await pool.query('DELETE FROM historias WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
   res.json({ ok: true });
 });
 
-// ── Inventario básico ────────────────────────────────────────
-app.get('/api/productos', verificarToken, requireCliente, async (req, res) => {
-  const [rows] = await pool.query('SELECT * FROM productos WHERE cuenta_id=? ORDER BY nombre ASC', [req.user.id]);
+// ══════════════════════════════════════════════════════════════
+// INVENTARIO — solo propietario administra; recepción solo lee (para vender)
+// ══════════════════════════════════════════════════════════════
+app.get('/api/productos', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
+  const [rows] = await pool.query('SELECT * FROM productos WHERE empresa_id=? ORDER BY nombre ASC', [req.user.empresa_id]);
   res.json({ ok: true, productos: rows });
 });
 
-app.post('/api/productos', verificarToken, requireCliente, async (req, res) => {
+app.post('/api/productos', verificarToken, requireRoles('propietario'), async (req, res) => {
   const { nombre, categoria, precio_venta, precio_compra, stock, stock_minimo } = req.body || {};
   if (!nombre) return res.status(400).json({ ok: false, error: 'El nombre es obligatorio' });
   const [result] = await pool.query(
-    `INSERT INTO productos (cuenta_id, nombre, categoria, precio_venta, precio_compra, stock, stock_minimo)
-     VALUES (?,?,?,?,?,?,?)`,
-    [req.user.id, nombre, categoria || '', precio_venta || 0, precio_compra || 0, stock || 0, stock_minimo || 0]
+    `INSERT INTO productos (empresa_id, nombre, categoria, precio_venta, precio_compra, stock, stock_minimo) VALUES (?,?,?,?,?,?,?)`,
+    [req.user.empresa_id, nombre, categoria || '', precio_venta || 0, precio_compra || 0, stock || 0, stock_minimo || 0]
   );
   res.json({ ok: true, id: result.insertId });
 });
 
-app.put('/api/productos/:id', verificarToken, requireCliente, async (req, res) => {
+app.put('/api/productos/:id', verificarToken, requireRoles('propietario'), async (req, res) => {
   const { nombre, categoria, precio_venta, precio_compra, stock, stock_minimo } = req.body || {};
   await pool.query(
-    `UPDATE productos SET nombre=?, categoria=?, precio_venta=?, precio_compra=?, stock=?, stock_minimo=?
-     WHERE id=? AND cuenta_id=?`,
-    [nombre, categoria || '', precio_venta || 0, precio_compra || 0, stock || 0, stock_minimo || 0, req.params.id, req.user.id]
+    `UPDATE productos SET nombre=?, categoria=?, precio_venta=?, precio_compra=?, stock=?, stock_minimo=? WHERE id=? AND empresa_id=?`,
+    [nombre, categoria || '', precio_venta || 0, precio_compra || 0, stock || 0, stock_minimo || 0, req.params.id, req.user.empresa_id]
   );
   res.json({ ok: true });
 });
 
-app.delete('/api/productos/:id', verificarToken, requireCliente, async (req, res) => {
-  await pool.query('DELETE FROM productos WHERE id=? AND cuenta_id=?', [req.params.id, req.user.id]);
+app.delete('/api/productos/:id', verificarToken, requireRoles('propietario'), async (req, res) => {
+  await pool.query('DELETE FROM productos WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
   res.json({ ok: true });
 });
 
-// ── Ventas / facturación ─────────────────────────────────────
-app.get('/api/ventas', verificarToken, requireCliente, async (req, res) => {
+// ══════════════════════════════════════════════════════════════
+// VENTAS — propietario y recepción (veterinario NO)
+// ══════════════════════════════════════════════════════════════
+app.get('/api/ventas', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
   const [rows] = await pool.query(
     `SELECT v.*, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre
      FROM ventas v
      LEFT JOIN clientes c ON c.id = v.cliente_id
      LEFT JOIN pacientes pa ON pa.id = v.paciente_id
-     WHERE v.cuenta_id=? ORDER BY v.id DESC`, [req.user.id]
+     WHERE v.empresa_id=? ORDER BY v.id DESC`, [req.user.empresa_id]
   );
   res.json({ ok: true, ventas: rows });
 });
 
-app.post('/api/ventas', verificarToken, requireCliente, async (req, res) => {
+app.post('/api/ventas', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const { cliente_id, paciente_id, items, descuento, metodo_pago, estado_pago } = req.body || {};
-    if (!Array.isArray(items) || !items.length) {
-      return res.status(400).json({ ok: false, error: 'Agrega al menos un producto o servicio' });
-    }
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ ok: false, error: 'Agrega al menos un producto o servicio' });
 
     await conn.beginTransaction();
-
     let subtotal = 0;
     for (const item of items) {
       subtotal += Number(item.precio) * Number(item.cantidad || 1);
       if (item.producto_id) {
-        await conn.query(
-          'UPDATE productos SET stock = GREATEST(stock - ?, 0) WHERE id=? AND cuenta_id=?',
-          [item.cantidad || 1, item.producto_id, req.user.id]
-        );
+        await conn.query('UPDATE productos SET stock = GREATEST(stock - ?, 0) WHERE id=? AND empresa_id=?',
+          [item.cantidad || 1, item.producto_id, req.user.empresa_id]);
       }
     }
     const total = Math.max(subtotal - Number(descuento || 0), 0);
-
     const [result] = await conn.query(
-      `INSERT INTO ventas (cuenta_id, cliente_id, paciente_id, items_json, subtotal, descuento, total, metodo_pago, estado_pago)
+      `INSERT INTO ventas (empresa_id, cliente_id, paciente_id, items_json, subtotal, descuento, total, metodo_pago, estado_pago)
        VALUES (?,?,?,?,?,?,?,?,?)`,
-      [req.user.id, cliente_id || null, paciente_id || null, JSON.stringify(items),
+      [req.user.empresa_id, cliente_id || null, paciente_id || null, JSON.stringify(items),
        subtotal, descuento || 0, total, metodo_pago || 'efectivo', estado_pago || 'pagado']
     );
-
     await conn.commit();
     res.json({ ok: true, id: result.insertId, total });
   } catch (e) {
@@ -550,31 +555,30 @@ app.post('/api/ventas', verificarToken, requireCliente, async (req, res) => {
   }
 });
 
-app.delete('/api/ventas/:id', verificarToken, requireCliente, async (req, res) => {
-  await pool.query('DELETE FROM ventas WHERE id=? AND cuenta_id=?', [req.params.id, req.user.id]);
+app.delete('/api/ventas/:id', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
+  await pool.query('DELETE FROM ventas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
   res.json({ ok: true });
 });
 
-// ── Dashboard resumen (cliente) ───────────────────────────────
-app.get('/api/resumen', verificarToken, requireCliente, async (req, res) => {
-  const uid = req.user.id;
-  const [[{ totalClientes }]] = await pool.query('SELECT COUNT(*) AS totalClientes FROM clientes WHERE cuenta_id=?', [uid]);
-  const [[{ totalPacientes }]] = await pool.query('SELECT COUNT(*) AS totalPacientes FROM pacientes WHERE cuenta_id=?', [uid]);
-  const [[{ citasHoy }]] = await pool.query('SELECT COUNT(*) AS citasHoy FROM citas WHERE cuenta_id=? AND fecha=CURDATE()', [uid]);
-  const [[{ enEspera }]] = await pool.query(`SELECT COUNT(*) AS enEspera FROM citas WHERE cuenta_id=? AND fecha=CURDATE() AND estado='en_espera'`, [uid]);
+// ══════════════════════════════════════════════════════════════
+// DASHBOARD RESUMEN — compartido, cada frontend muestra lo que le sirve
+// ══════════════════════════════════════════════════════════════
+app.get('/api/resumen', verificarToken, requireEmpresa, async (req, res) => {
+  const eid = req.user.empresa_id;
+  const [[{ totalClientes }]] = await pool.query('SELECT COUNT(*) AS totalClientes FROM clientes WHERE empresa_id=?', [eid]);
+  const [[{ totalPacientes }]] = await pool.query('SELECT COUNT(*) AS totalPacientes FROM pacientes WHERE empresa_id=?', [eid]);
+  const [[{ citasHoy }]] = await pool.query('SELECT COUNT(*) AS citasHoy FROM citas WHERE empresa_id=? AND fecha=CURDATE()', [eid]);
+  const [[{ enEspera }]] = await pool.query(`SELECT COUNT(*) AS enEspera FROM atenciones WHERE empresa_id=? AND estado IN ('llegada','triaje','espera')`, [eid]);
   const [[{ ventasMes }]] = await pool.query(
-    `SELECT COALESCE(SUM(total),0) AS ventasMes FROM ventas
-     WHERE cuenta_id=? AND MONTH(created_at)=MONTH(CURDATE()) AND YEAR(created_at)=YEAR(CURDATE())`, [uid]
+    `SELECT COALESCE(SUM(total),0) AS ventasMes FROM ventas WHERE empresa_id=? AND MONTH(created_at)=MONTH(CURDATE()) AND YEAR(created_at)=YEAR(CURDATE())`, [eid]
   );
-  const [[{ ventasHoy }]] = await pool.query(
-    `SELECT COALESCE(SUM(total),0) AS ventasHoy FROM ventas WHERE cuenta_id=? AND DATE(created_at)=CURDATE()`, [uid]
-  );
-  const [[{ stockBajo }]] = await pool.query('SELECT COUNT(*) AS stockBajo FROM productos WHERE cuenta_id=? AND stock <= stock_minimo', [uid]);
+  const [[{ ventasHoy }]] = await pool.query(`SELECT COALESCE(SUM(total),0) AS ventasHoy FROM ventas WHERE empresa_id=? AND DATE(created_at)=CURDATE()`, [eid]);
+  const [[{ stockBajo }]] = await pool.query('SELECT COUNT(*) AS stockBajo FROM productos WHERE empresa_id=? AND stock <= stock_minimo', [eid]);
   const [proximasCitas] = await pool.query(
     `SELECT ci.*, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre
      FROM citas ci LEFT JOIN clientes c ON c.id=ci.cliente_id LEFT JOIN pacientes pa ON pa.id=ci.paciente_id
-     WHERE ci.cuenta_id=? AND ci.fecha=CURDATE() AND ci.estado NOT IN ('cancelada','atendida')
-     ORDER BY ci.hora ASC LIMIT 6`, [uid]
+     WHERE ci.empresa_id=? AND ci.fecha=CURDATE() AND ci.estado NOT IN ('cancelada','atendida')
+     ORDER BY ci.hora ASC LIMIT 6`, [eid]
   );
   const alertas = Number(stockBajo);
   res.json({ ok: true, totalClientes, totalPacientes, citasHoy, enEspera, ventasMes, ventasHoy, stockBajo, alertas, proximasCitas });
