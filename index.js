@@ -113,6 +113,62 @@ async function resolverRango(req) {
   }
   return { desde, hasta, limitado };
 }
+// ── STOCK POR ALMACÉN ────────────────────────────────────────
+async function almacenPrincipal(db, empresaId) {
+  const [r] = await db.query(`SELECT id FROM almacenes WHERE empresa_id=? ORDER BY es_principal DESC, id ASC LIMIT 1`, [empresaId]);
+  if (r.length) return r[0].id;
+  const [ins] = await db.query(`INSERT INTO almacenes (empresa_id, nombre, es_principal) VALUES (?, 'Principal', 1)`, [empresaId]);
+  return ins.insertId;
+}
+
+// Suma/resta stock en un almacén, mantiene productos.stock (total) y registra el kardex
+async function moverStock(conn, { empresaId, productoId, almacenId, delta, tipo, motivo, usuarioId, docId = null }) {
+  await conn.query(
+    `INSERT INTO stock_almacen (empresa_id, producto_id, almacen_id, stock) VALUES (?,?,?,0)
+     ON DUPLICATE KEY UPDATE stock = stock`, [empresaId, productoId, almacenId]);
+  const [[fila]] = await conn.query(
+    `SELECT stock FROM stock_almacen WHERE producto_id=? AND almacen_id=? FOR UPDATE`, [productoId, almacenId]);
+  if (Number(fila.stock) + delta < 0) throw new Error('Stock insuficiente en el almacén seleccionado');
+  await conn.query(`UPDATE stock_almacen SET stock = stock + ? WHERE producto_id=? AND almacen_id=?`, [delta, productoId, almacenId]);
+  await conn.query(`UPDATE productos SET stock = stock + ? WHERE id=? AND empresa_id=?`, [delta, productoId, empresaId]);
+  const [[p]] = await conn.query(`SELECT stock FROM productos WHERE id=?`, [productoId]);
+  await conn.query(
+    `INSERT INTO movimientos_stock (empresa_id, producto_id, almacen_id, tipo, cantidad, saldo, motivo, documento_id, usuario_id)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+    [empresaId, productoId, almacenId, tipo, delta, p.stock, motivo || '', docId, usuarioId]);
+}
+
+// Las ventas descuentan primero del almacén principal y luego de los demás
+async function descontarVenta(conn, empresaId, productoId, cantidad, usuarioId) {
+  let falta = Number(cantidad);
+  const [filas] = await conn.query(
+    `SELECT sa.almacen_id, sa.stock FROM stock_almacen sa JOIN almacenes a ON a.id = sa.almacen_id
+     WHERE sa.empresa_id=? AND sa.producto_id=? AND sa.stock>0 ORDER BY a.es_principal DESC, a.id ASC`,
+    [empresaId, productoId]);
+  for (const f of filas) {
+    if (falta <= 0) break;
+    const tomar = Math.min(falta, Number(f.stock));
+    await moverStock(conn, { empresaId, productoId, almacenId: f.almacen_id, delta: -tomar, tipo: 'venta', motivo: 'Venta', usuarioId });
+    falta -= tomar;
+  }
+}
+
+function datosProducto(b) {
+  const cero = (x) => x === 0 || x === '0';
+  return {
+    nombre: String(b.nombre || '').trim(),
+    codigo_barras: b.codigo_barras || '', marca: b.marca || '', proveedor: b.proveedor || '',
+    linea: b.linea || '', categoria: b.categoria || '', subcategoria: b.subcategoria || '',
+    presentacion: b.presentacion || '', contenido: b.contenido || '', unidad_medida: b.unidad_medida || 'UND',
+    precio_compra: Number(b.precio_compra) || 0, precio_venta: Number(b.precio_venta) || 0,
+    stock_minimo: parseInt(b.stock_minimo) || 0, stock_maximo: parseInt(b.stock_maximo) || 0,
+    disponible_venta: cero(b.disponible_venta) ? 0 : 1,
+    frecuencia_dias: b.frecuencia_dias ? parseInt(b.frecuencia_dias) : null,
+    activo: cero(b.activo) ? 0 : 1,
+  };
+}
+
+
 
 // ── AUTH ─────────────────────────────────────────────────────
 // Login único: cada cuenta (admin, propietario, veterinario, recepcion) tiene su propio email+password
@@ -624,30 +680,152 @@ app.get('/api/productos', verificarToken, requireRoles('propietario', 'recepcion
   const [rows] = await pool.query('SELECT * FROM productos WHERE empresa_id=? ORDER BY nombre ASC', [req.user.empresa_id]);
   res.json({ ok: true, productos: rows });
 }));
+app.post('/api/productos', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const d = datosProducto(req.body || {});
+    if (!d.nombre) return res.status(400).json({ ok: false, error: 'El nombre es obligatorio' });
+    const inicial = parseInt((req.body || {}).stock_inicial) || 0;
+    const eid = req.user.empresa_id;
+    await conn.beginTransaction();
+    const [r] = await conn.query('INSERT INTO productos SET ?', [{ ...d, empresa_id: eid, stock: 0 }]);
+    if (inicial > 0) {
+      const alm = await almacenPrincipal(conn, eid);
+      await moverStock(conn, { empresaId: eid, productoId: r.insertId, almacenId: alm, delta: inicial, tipo: 'carga', motivo: 'Stock inicial', usuarioId: req.user.id });
+    }
+    await conn.commit();
+    res.json({ ok: true, id: r.insertId });
+  } catch (e) {
+    await conn.rollback();
+    res.status(500).json({ ok: false, error: e.message });
+  } finally { conn.release(); }
+});
 
-app.post('/api/productos', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
-  const { nombre, categoria, precio_venta, precio_compra, stock, stock_minimo } = req.body || {};
-  if (!nombre) return res.status(400).json({ ok: false, error: 'El nombre es obligatorio' });
-  const [result] = await pool.query(
-    `INSERT INTO productos (empresa_id, nombre, categoria, precio_venta, precio_compra, stock, stock_minimo) VALUES (?,?,?,?,?,?,?)`,
-    [req.user.empresa_id, nombre, categoria || '', precio_venta || 0, precio_compra || 0, stock || 0, stock_minimo || 0]
-  );
-  res.json({ ok: true, id: result.insertId });
-}));
-
+// El stock NO se edita aquí: se cambia con cargar/descargar stock
 app.put('/api/productos/:id', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
-  const { nombre, categoria, precio_venta, precio_compra, stock, stock_minimo } = req.body || {};
-  await pool.query(
-    `UPDATE productos SET nombre=?, categoria=?, precio_venta=?, precio_compra=?, stock=?, stock_minimo=? WHERE id=? AND empresa_id=?`,
-    [nombre, categoria || '', precio_venta || 0, precio_compra || 0, stock || 0, stock_minimo || 0, req.params.id, req.user.empresa_id]
-  );
+  const d = datosProducto(req.body || {});
+  if (!d.nombre) return res.status(400).json({ ok: false, error: 'El nombre es obligatorio' });
+  await pool.query('UPDATE productos SET ? WHERE id=? AND empresa_id=?', [d, req.params.id, req.user.empresa_id]);
   res.json({ ok: true });
 }));
 
 app.delete('/api/productos/:id', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
+  await pool.query('DELETE FROM stock_almacen WHERE producto_id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
   await pool.query('DELETE FROM productos WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
   res.json({ ok: true });
 }));
+
+app.get('/api/productos/:id/kardex', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT m.*, a.nombre AS almacen_nombre, u.nombre AS usuario_nombre
+     FROM movimientos_stock m
+     LEFT JOIN almacenes a ON a.id = m.almacen_id
+     LEFT JOIN usuarios u ON u.id = m.usuario_id
+     WHERE m.producto_id=? AND m.empresa_id=? ORDER BY m.id DESC LIMIT 200`,
+    [req.params.id, req.user.empresa_id]);
+  res.json({ ok: true, movimientos: rows });
+}));
+
+// ── ALMACENES ────────────────────────────────────────────────
+app.get('/api/almacenes', verificarToken, requireEmpresa, ah(async (req, res) => {
+  await almacenPrincipal(pool, req.user.empresa_id);
+  const [rows] = await pool.query('SELECT id, nombre, es_principal FROM almacenes WHERE empresa_id=? ORDER BY es_principal DESC, nombre', [req.user.empresa_id]);
+  res.json({ ok: true, almacenes: rows });
+}));
+
+app.post('/api/almacenes', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
+  const nombre = String((req.body || {}).nombre || '').trim();
+  if (!nombre) return res.status(400).json({ ok: false, error: 'El nombre es obligatorio' });
+  const [r] = await pool.query('INSERT INTO almacenes (empresa_id, nombre) VALUES (?,?)', [req.user.empresa_id, nombre]);
+  res.json({ ok: true, id: r.insertId });
+}));
+
+// Stock por almacén: cada producto × cada almacén (con 0 si no hay)
+app.get('/api/stock-almacen', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
+  const eid = req.user.empresa_id;
+  await almacenPrincipal(pool, eid);
+  const [rows] = await pool.query(
+    `SELECT p.id AS producto_id, p.nombre, p.precio_compra, p.precio_venta,
+            a.id AS almacen_id, a.nombre AS almacen, COALESCE(sa.stock,0) AS stock
+     FROM productos p
+     JOIN almacenes a ON a.empresa_id = p.empresa_id
+     LEFT JOIN stock_almacen sa ON sa.producto_id = p.id AND sa.almacen_id = a.id
+     WHERE p.empresa_id=? ORDER BY p.nombre, a.es_principal DESC, a.id`, [eid]);
+  res.json({ ok: true, filas: rows });
+}));
+
+// ── CARGAS / DESCARGAS DE STOCK ──────────────────────────────
+app.get('/api/stock-documentos', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
+  const tipo = req.query.tipo === 'descarga' ? 'descarga' : 'carga';
+  const [rows] = await pool.query(
+    `SELECT d.id, d.numero, d.tipo, d.motivo, d.tipo_operacion, d.responsable, d.total, d.created_at,
+            a.nombre AS almacen_nombre, u.nombre AS registrado_por
+     FROM stock_documentos d
+     LEFT JOIN almacenes a ON a.id = d.almacen_id
+     LEFT JOIN usuarios u ON u.id = d.usuario_id
+     WHERE d.empresa_id=? AND d.tipo=? ORDER BY d.id DESC LIMIT 200`, [req.user.empresa_id, tipo]);
+  res.json({ ok: true, documentos: rows });
+}));
+
+app.get('/api/stock-documentos/:id', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT d.*, a.nombre AS almacen_nombre, u.nombre AS registrado_por
+     FROM stock_documentos d
+     LEFT JOIN almacenes a ON a.id = d.almacen_id
+     LEFT JOIN usuarios u ON u.id = d.usuario_id
+     WHERE d.id=? AND d.empresa_id=?`, [req.params.id, req.user.empresa_id]);
+  if (!rows[0]) return res.status(404).json({ ok: false, error: 'Documento no encontrado' });
+  let items = [];
+  try { items = typeof rows[0].items_json === 'string' ? JSON.parse(rows[0].items_json) : (rows[0].items_json || []); } catch (e) {}
+  res.json({ ok: true, documento: { ...rows[0], items_json: undefined, items } });
+}));
+
+app.post('/api/stock-documentos', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const eid = req.user.empresa_id;
+    const { tipo, almacen_id, motivo, tipo_operacion, responsable, items } = req.body || {};
+    if (!['carga', 'descarga'].includes(tipo)) return res.status(400).json({ ok: false, error: 'Tipo inválido' });
+    if (!String(motivo || '').trim()) return res.status(400).json({ ok: false, error: 'El motivo es obligatorio' });
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ ok: false, error: 'Agrega al menos un producto' });
+    const [alm] = await conn.query('SELECT id FROM almacenes WHERE id=? AND empresa_id=?', [almacen_id, eid]);
+    if (!alm.length) return res.status(400).json({ ok: false, error: 'Almacén no válido' });
+
+    await conn.beginTransaction();
+    const [[{ n }]] = await conn.query('SELECT COALESCE(MAX(numero),0)+1 AS n FROM stock_documentos WHERE empresa_id=? AND tipo=?', [eid, tipo]);
+    const [ins] = await conn.query(
+      `INSERT INTO stock_documentos (empresa_id, numero, tipo, almacen_id, motivo, tipo_operacion, responsable, usuario_id, items_json, total)
+       VALUES (?,?,?,?,?,?,?,?,'[]',0)`,
+      [eid, n, tipo, almacen_id, String(motivo).trim(), tipo_operacion || '', responsable || '', req.user.id]);
+    const docId = ins.insertId;
+
+    const detalle = []; let total = 0;
+    for (const it of items) {
+      const cant = parseInt(it.cantidad);
+      if (!cant || cant < 1) throw new Error('Cantidad inválida');
+      const [[p]] = await conn.query('SELECT * FROM productos WHERE id=? AND empresa_id=?', [it.producto_id, eid]);
+      if (!p) throw new Error('Producto no encontrado');
+      let pc = Number(p.precio_compra), pv = Number(p.precio_venta);
+      if (tipo === 'carga') {
+        if (it.precio_compra !== undefined && it.precio_compra !== '') pc = Number(it.precio_compra) || 0;
+        if (it.precio_venta !== undefined && it.precio_venta !== '') pv = Number(it.precio_venta) || 0;
+        await conn.query('UPDATE productos SET precio_compra=?, precio_venta=? WHERE id=? AND empresa_id=?', [pc, pv, p.id, eid]);
+      }
+      await moverStock(conn, {
+        empresaId: eid, productoId: p.id, almacenId: almacen_id, delta: tipo === 'carga' ? cant : -cant,
+        tipo, motivo: String(motivo).trim(), usuarioId: req.user.id, docId
+      });
+      detalle.push({ producto_id: p.id, codigo_barras: p.codigo_barras, nombre: p.nombre, precio_compra: pc, precio_venta: pv, cantidad: cant });
+      total += pc * cant;
+    }
+    await conn.query('UPDATE stock_documentos SET items_json=?, total=? WHERE id=?', [JSON.stringify(detalle), total, docId]);
+    await conn.commit();
+    res.json({ ok: true, id: docId, numero: n });
+  } catch (e) {
+    await conn.rollback();
+    res.status(400).json({ ok: false, error: e.message });
+  } finally { conn.release(); }
+});
 
 // ══════════════════════════════════════════════════════════════
 // VENTAS / COBROS — los 3 roles crean y consultan; borrar: propietario y recepción
@@ -674,8 +852,7 @@ app.post('/api/ventas', verificarToken, requireRoles('propietario', 'recepcion',
     for (const item of items) {
       subtotal += Number(item.precio) * Number(item.cantidad || 1);
       if (item.producto_id) {
-        await conn.query('UPDATE productos SET stock = GREATEST(stock - ?, 0) WHERE id=? AND empresa_id=?',
-          [item.cantidad || 1, item.producto_id, req.user.empresa_id]);
+        await descontarVenta(conn, req.user.empresa_id, item.producto_id, Number(item.cantidad || 1), req.user.id);
       }
     }
     const total = Math.max(subtotal - Number(descuento || 0), 0);
