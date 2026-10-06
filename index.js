@@ -618,6 +618,44 @@ app.put('/api/citas/:id', verificarToken, requireRoles('propietario', 'recepcion
   res.json({ ok: true });
 }));
 
+
+// El veterinario inicia / finaliza SU cita: pendiente → en proceso (atendiendo) → finalizado (atendida)
+// También sincroniza la atención vinculada (consulta → cerrada)
+app.put('/api/citas/:id/estado', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
+  const { estado } = req.body || {};
+  if (!['atendiendo', 'atendida'].includes(estado)) return res.status(400).json({ ok: false, error: 'Estado inválido' });
+
+  const eid = req.user.empresa_id;
+  const params = [req.params.id, eid];
+  let filtro = '';
+  if (req.user.rol === 'veterinario') { filtro = ' AND veterinario_id=?'; params.push(req.user.id); }
+  const [rows] = await pool.query(`SELECT * FROM citas WHERE id=? AND empresa_id=?${filtro}`, params);
+  const cita = rows[0];
+  if (!cita) return res.status(404).json({ ok: false, error: 'Cita no encontrada' });
+  if (['cancelada', 'no_asistio'].includes(cita.estado)) {
+    return res.status(400).json({ ok: false, error: 'No se puede cambiar una cita cancelada' });
+  }
+
+  await pool.query('UPDATE citas SET estado=? WHERE id=?', [estado, cita.id]);
+
+  // Conexión con Atenciones
+  if (cita.paciente_id && cita.cliente_id) {
+    const [at] = await pool.query(
+      'SELECT id FROM atenciones WHERE cita_id=? AND empresa_id=? ORDER BY id DESC LIMIT 1', [cita.id, eid]);
+    const estadoAt = estado === 'atendiendo' ? 'consulta' : 'cerrada';
+    if (at.length) {
+      await pool.query('UPDATE atenciones SET estado=? WHERE id=?', [estadoAt, at[0].id]);
+    } else if (estado === 'atendiendo') {
+      await pool.query(
+        `INSERT INTO atenciones (empresa_id, staff_id, veterinario_id, paciente_id, cliente_id, cita_id, origen, prioridad, estado)
+         VALUES (?,?,?,?,?,?, 'con_cita', 'normal', 'consulta')`,
+        [eid, req.user.id, cita.veterinario_id || req.user.id, cita.paciente_id, cita.cliente_id, cita.id]);
+    }
+  }
+  res.json({ ok: true });
+}));
+
+
 app.delete('/api/citas/:id', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
   await pool.query('DELETE FROM citas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
   res.json({ ok: true });
