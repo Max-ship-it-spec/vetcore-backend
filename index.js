@@ -536,10 +536,11 @@ app.get('/api/citas', verificarToken, requireEmpresa, ah(async (req, res) => {
   res.json({ ok: true, citas: rows });
 }));
 
-app.post('/api/citas', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
+app.post('/api/citas', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
   const { cliente_id, paciente_id, veterinario_id, fecha, hora, motivo, notas } = req.body || {};
   if (!fecha) return res.status(400).json({ ok: false, error: 'La fecha es obligatoria' });
-  const vetId = await vetValido(veterinario_id, req.user.empresa_id);
+  // Si lo crea un veterinario, la cita queda asignada a él
+  const vetId = req.user.rol === 'veterinario' ? req.user.id : await vetValido(veterinario_id, req.user.empresa_id);
   if (vetId === false) return res.status(400).json({ ok: false, error: 'Veterinario no válido' });
   const [result] = await pool.query(
     `INSERT INTO citas (empresa_id, cliente_id, paciente_id, veterinario_id, fecha, hora, motivo, notas) VALUES (?,?,?,?,?,?,?,?)`,
