@@ -582,7 +582,7 @@ app.get('/api/citas', verificarToken, requireEmpresa, ah(async (req, res) => {
   if (req.query.hoy === '1') filtro += ' AND ci.fecha = CURDATE()';
   if (req.query.pendientes === '1') filtro += " AND ci.estado IN ('pendiente','confirmada') AND ci.fecha >= CURDATE()";
   const [rows] = await pool.query(
-    `SELECT ci.*, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre, v.nombre AS veterinario_nombre
+    `SELECT ci.*, c.nombre AS cliente_nombre, c.telefono AS cliente_telefono, pa.nombre AS paciente_nombre, v.nombre AS veterinario_nombre
      FROM citas ci
      LEFT JOIN clientes c ON c.id = ci.cliente_id
      LEFT JOIN pacientes pa ON pa.id = ci.paciente_id
