@@ -1035,5 +1035,10 @@ app.get('/api/resumen', verificarToken, requireRoles('propietario'), ah(async (r
 // ── Salud del servicio ───────────────────────────────────────
 app.get('/', (req, res) => res.json({ ok: true, servicio: 'Vetcore API' }));
 
+// Migración temporal: agrega foto_url a productos (se puede borrar después de desplegar)
+pool.query('ALTER TABLE productos ADD COLUMN foto_url VARCHAR(500) NULL')
+  .then(() => console.log('✅ Columna foto_url creada'))
+  .catch(e => console.log('ℹ️ foto_url:', e.message));
+
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`🐾 Vetcore API corriendo en el puerto ${PORT}`));
