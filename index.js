@@ -739,6 +739,13 @@ app.post('/api/productos', verificarToken, requireRoles('propietario', 'recepcio
   } finally { conn.release(); }
 });
 
+app.post('/api/productos/:id/foto', verificarToken, requireRoles('propietario', 'recepcion'), upload.single('foto'), ah(async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió ninguna imagen' });
+  const result = await subirACloudinary(req.file.buffer, 'vetcore/productos');
+  await pool.query('UPDATE productos SET foto_url=? WHERE id=? AND empresa_id=?', [result.secure_url, req.params.id, req.user.empresa_id]);
+  res.json({ ok: true, foto_url: result.secure_url });
+}));
+
 // El stock NO se edita aquí: se cambia con cargar/descargar stock
 app.put('/api/productos/:id', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
   const d = datosProducto(req.body || {});
