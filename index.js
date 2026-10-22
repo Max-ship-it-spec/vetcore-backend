@@ -1126,6 +1126,48 @@ app.get('/api/hospitalizaciones', verificarToken, requireRoles('propietario', 'v
 }));
 
 
+
+app.post('/api/recetas', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
+  const { paciente_id, historia_id, fecha, prescripcion, indicaciones } = req.body || {};
+  if (!paciente_id) return res.status(400).json({ ok: false, error: 'Paciente obligatorio' });
+  const eid = req.user.empresa_id;
+  const [pa] = await pool.query('SELECT id FROM pacientes WHERE id=? AND empresa_id=?', [paciente_id, eid]);
+  if (!pa.length) return res.status(404).json({ ok: false, error: 'Paciente no encontrado' });
+  const [[{ n }]] = await pool.query('SELECT COALESCE(MAX(numero),0)+1 AS n FROM recetas WHERE empresa_id=?', [eid]);
+  const [ins] = await pool.query(
+    `INSERT INTO recetas (empresa_id, numero, paciente_id, historia_id, veterinario_id, fecha, prescripcion, indicaciones)
+     VALUES (?,?,?,?,?,?,?,?)`,
+    [eid, n, paciente_id, historia_id || null, req.user.rol === 'veterinario' ? req.user.id : null,
+     fecha || new Date().toISOString().slice(0, 10), prescripcion || '', indicaciones || '']
+  );
+  res.json({ ok: true, id: ins.insertId, numero: n });
+}));
+ 
+// Sube la imagen PNG de la receta a Cloudinary
+app.post('/api/recetas/:id/imagen', verificarToken, requireRoles('propietario', 'veterinario'), upload.single('imagen'), ah(async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió la imagen' });
+  const r = await subirACloudinary(req.file.buffer, 'vetcore/recetas');
+  const [u] = await pool.query('UPDATE recetas SET imagen_url=? WHERE id=? AND empresa_id=?', [r.secure_url, req.params.id, req.user.empresa_id]);
+  if (!u.affectedRows) return res.status(404).json({ ok: false, error: 'Receta no encontrada' });
+  res.json({ ok: true, imagen_url: r.secure_url });
+}));
+ 
+// Recetas guardadas de un paciente (las últimas 10)
+app.get('/api/recetas', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT id, numero, paciente_id, historia_id, DATE_FORMAT(fecha,'%Y-%m-%d') AS fecha, imagen_url
+     FROM recetas WHERE empresa_id=? AND paciente_id=? AND imagen_url IS NOT NULL
+     ORDER BY id DESC LIMIT 10`,
+    [req.user.empresa_id, req.query.paciente_id || 0]
+  );
+  res.json({ ok: true, recetas: rows });
+}));
+ 
+app.delete('/api/recetas/:id', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
+  await pool.query('DELETE FROM recetas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
+  res.json({ ok: true });
+}));
+
 // ── Salud del servicio ───────────────────────────────────────
 app.get('/', (req, res) => res.json({ ok: true, servicio: 'Vetcore API' }));
 
