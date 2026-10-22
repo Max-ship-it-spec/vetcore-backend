@@ -689,21 +689,36 @@ app.get('/api/historias/:paciente_id', verificarToken, requireRoles('propietario
     [req.params.paciente_id, req.user.empresa_id]
   );
   const historias = req.user.rol === 'recepcion'
-    ? rows.map(h => ({ ...h, diagnostico: '', tratamiento: '', medicamentos: '' }))
+    ? rows.map(h => ({ ...h, diagnostico: '', tratamiento: '', medicamentos: '', datos_json: null }))
     : rows;
   res.json({ ok: true, historias });
 }));
 
 app.post('/api/historias', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const { paciente_id, fecha, motivo, anamnesis, peso, temperatura, fc, fr, diagnostico, tratamiento, medicamentos, recomendaciones, proximo_control } = req.body || {};
+  const { paciente_id, fecha, motivo, anamnesis, peso, temperatura, fc, fr, diagnostico, tratamiento, medicamentos, recomendaciones, proximo_control, datos_json } = req.body || {};
   if (!paciente_id || !fecha) return res.status(400).json({ ok: false, error: 'Paciente y fecha son obligatorios' });
+  const [[u]] = await pool.query('SELECT nombre FROM usuarios WHERE id=?', [req.user.id]);
   const [result] = await pool.query(
-    `INSERT INTO historias (empresa_id, paciente_id, fecha, motivo, anamnesis, peso, temperatura, fc, fr, diagnostico, tratamiento, medicamentos, recomendaciones, proximo_control)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    `INSERT INTO historias (empresa_id, paciente_id, fecha, motivo, anamnesis, peso, temperatura, fc, fr, diagnostico, tratamiento, medicamentos, recomendaciones, proximo_control, datos_json, atendio)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [req.user.empresa_id, paciente_id, fecha, motivo || '', anamnesis || '', peso || null, temperatura || null,
-     fc || '', fr || '', diagnostico || '', tratamiento || '', medicamentos || '', recomendaciones || '', proximo_control || null]
+     fc || '', fr || '', diagnostico || '', tratamiento || '', medicamentos || '', recomendaciones || '', proximo_control || null,
+     datos_json || null, u?.nombre || '']
   );
   res.json({ ok: true, id: result.insertId });
+}));
+
+app.put('/api/historias/:id', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
+  const { fecha, motivo, anamnesis, peso, temperatura, fc, fr, diagnostico, tratamiento, medicamentos, recomendaciones, proximo_control, datos_json } = req.body || {};
+  if (!fecha) return res.status(400).json({ ok: false, error: 'La fecha es obligatoria' });
+  await pool.query(
+    `UPDATE historias SET fecha=?, motivo=?, anamnesis=?, peso=?, temperatura=?, fc=?, fr=?, diagnostico=?, tratamiento=?, medicamentos=?, recomendaciones=?, proximo_control=?, datos_json=?
+     WHERE id=? AND empresa_id=?`,
+    [fecha, motivo || '', anamnesis || '', peso || null, temperatura || null, fc || '', fr || '', diagnostico || '',
+     tratamiento || '', medicamentos || '', recomendaciones || '', proximo_control || null, datos_json || null,
+     req.params.id, req.user.empresa_id]
+  );
+  res.json({ ok: true });
 }));
 
 app.delete('/api/historias/:id', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
@@ -1038,6 +1053,78 @@ app.get('/api/resumen', verificarToken, requireRoles('propietario'), ah(async (r
   const alertas = Number(stockBajo);
   res.json({ ok: true, totalClientes, totalPacientes, citasHoy, enEspera, ventasMes, ventasHoy, stockBajo, alertas, proximasCitas });
 }));
+
+
+
+// ── (1) Subida de PDFs (laboratorio) ─────────────────────────
+const uploadPdf = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) =>
+    file.mimetype === 'application/pdf' ? cb(null, true) : cb(new Error('Solo se permiten archivos PDF')),
+});
+ 
+function subirPdfACloudinary(buffer, folder, nombre) {
+  const limpio = String(nombre || 'archivo.pdf').replace(/[^\w.\-]/g, '_');
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { folder, resource_type: 'raw', public_id: `${Date.now()}-${limpio}` },
+      (err, result) => err ? reject(err) : resolve(result)
+    );
+    stream.end(buffer);
+  });
+}
+ 
+// ── (2) Rutas ────────────────────────────────────────────────
+ 
+// Archivos de laboratorio (PDF) de una consulta
+app.get('/api/historia-archivos/:historia_id', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT id, nombre, url, created_at FROM historia_archivos WHERE historia_id=? AND empresa_id=? ORDER BY id`,
+    [req.params.historia_id, req.user.empresa_id]
+  );
+  res.json({ ok: true, archivos: rows });
+}));
+ 
+app.post('/api/historia-archivos/:historia_id', verificarToken, requireRoles('propietario', 'veterinario'), uploadPdf.single('archivo'), ah(async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió ningún PDF' });
+  const [h] = await pool.query('SELECT id FROM historias WHERE id=? AND empresa_id=?', [req.params.historia_id, req.user.empresa_id]);
+  if (!h.length) return res.status(404).json({ ok: false, error: 'Consulta no encontrada' });
+  const r = await subirPdfACloudinary(req.file.buffer, 'vetcore/laboratorio', req.file.originalname);
+  const [ins] = await pool.query(
+    `INSERT INTO historia_archivos (empresa_id, historia_id, nombre, url) VALUES (?,?,?,?)`,
+    [req.user.empresa_id, req.params.historia_id, req.file.originalname, r.secure_url]
+  );
+  res.json({ ok: true, id: ins.insertId, url: r.secure_url });
+}));
+ 
+app.delete('/api/historia-archivos/:id', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
+  await pool.query('DELETE FROM historia_archivos WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
+  res.json({ ok: true });
+}));
+ 
+// Hospitalizaciones
+app.post('/api/hospitalizaciones', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
+  const { paciente_id, historia_id, ingreso, area, motivo } = req.body || {};
+  if (!paciente_id) return res.status(400).json({ ok: false, error: 'Paciente obligatorio' });
+  const [ins] = await pool.query(
+    `INSERT INTO hospitalizaciones (empresa_id, paciente_id, historia_id, veterinario_id, ingreso, area, motivo)
+     VALUES (?,?,?,?,?,?,?)`,
+    [req.user.empresa_id, paciente_id, historia_id || null,
+     req.user.rol === 'veterinario' ? req.user.id : null,
+     ingreso ? String(ingreso).replace('T', ' ') : null, area || '', motivo || '']
+  );
+  res.json({ ok: true, id: ins.insertId });
+}));
+ 
+app.get('/api/hospitalizaciones', verificarToken, requireRoles('propietario', 'veterinario', 'recepcion'), ah(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT h.*, pa.nombre AS paciente_nombre FROM hospitalizaciones h
+     JOIN pacientes pa ON pa.id=h.paciente_id
+     WHERE h.empresa_id=? AND h.estado='activa' ORDER BY h.ingreso DESC`, [req.user.empresa_id]);
+  res.json({ ok: true, hospitalizaciones: rows });
+}));
+
 
 // ── Salud del servicio ───────────────────────────────────────
 app.get('/', (req, res) => res.json({ ok: true, servicio: 'Vetcore API' }));
