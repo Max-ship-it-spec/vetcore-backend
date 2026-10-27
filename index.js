@@ -1215,13 +1215,16 @@ app.post('/api/hospitalizaciones/:id/monitoreo', verificarToken, hospEscribe, ah
   if (!(await hospActiva(req, res))) return;
   const b = req.body || {};
   if (!b.fecha) return res.status(400).json({ ok: false, error: 'Falta la fecha' });
-  if (!b.temperatura && !b.fc && !b.fr && !b.mucosas && !b.observaciones)
-    return res.status(400).json({ ok: false, error: 'Registra al menos una medición' });
+  const campos = ['temperatura','fc','fr','mucosas','tllc','hidratacion_pct','consumo_agua','consumo_alimento','orina','heces','vomito','dolor','observaciones'];
+  if (!campos.some(k => b[k])) return res.status(400).json({ ok: false, error: 'Registra al menos una medición' });
   await pool.query(
-    `INSERT INTO hosp_monitoreo (empresa_id,hospitalizacion_id,fecha,temperatura,fc,fr,mucosas,dolor,hidratacion,observaciones,usuario)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    `INSERT INTO hosp_monitoreo (empresa_id,hospitalizacion_id,fecha,temperatura,fc,fr,mucosas,tllc,hidratacion_pct,
+       consumo_agua,consumo_alimento,orina,heces,vomito,dolor,hidratacion,observaciones,usuario)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [req.user.empresa_id, req.params.id, b.fecha, b.temperatura || null, b.fc || '', b.fr || '', b.mucosas || '',
-     b.dolor || '', b.hidratacion || '', b.observaciones || '', await nombreUsuario(req.user.id)]);
+     b.tllc || '', b.hidratacion_pct || '', b.consumo_agua || '', b.consumo_alimento || '', b.orina || '',
+     b.heces || '', b.vomito || '', b.dolor || '', b.hidratacion || '', b.observaciones || '',
+     await nombreUsuario(req.user.id)]);
   res.json({ ok: true });
 }));
 
