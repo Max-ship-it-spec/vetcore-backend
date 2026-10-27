@@ -1189,11 +1189,6 @@ app.put('/api/hosp-tratamientos/:id/estado', verificarToken, hospEscribe, ah(asy
 }));
 
 
-  const [tratamientos] = await pool.query(
-    `SELECT *, ${FT('programado')} AS prog_txt, ${FT('fecha_real')} AS real_txt FROM hosp_tratamientos
-     WHERE hospitalizacion_id=? AND empresa_id=? ORDER BY programado ASC, id ASC`, [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true, hospitalizacion: r[0], monitoreo, notas, tratamientos });
-
 app.get('/api/hospitalizaciones/:id', verificarToken, hospRoles, ah(async (req, res) => {
   const [r] = await pool.query(`${SEL_HOSP} WHERE h.id=? AND h.empresa_id=?`, [req.params.id, req.user.empresa_id]);
   if (!r[0]) return res.status(404).json({ ok: false, error: 'Hospitalización no encontrada' });
@@ -1203,7 +1198,11 @@ app.get('/api/hospitalizaciones/:id', verificarToken, hospRoles, ah(async (req, 
   const [notas] = await pool.query(
     `SELECT *, ${FT('fecha')} AS fecha_txt FROM hosp_notas WHERE hospitalizacion_id=? AND empresa_id=? ORDER BY fecha DESC, id DESC`,
     [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true, hospitalizacion: r[0], monitoreo, notas });
+  const [tratamientos] = await pool.query(
+    `SELECT *, ${FT('programado')} AS prog_txt, ${FT('fecha_real')} AS real_txt FROM hosp_tratamientos
+     WHERE hospitalizacion_id=? AND empresa_id=? ORDER BY programado ASC, id ASC`,
+    [req.params.id, req.user.empresa_id]);
+  res.json({ ok: true, hospitalizacion: r[0], monitoreo, notas, tratamientos });
 }));
 
 async function hospActiva(req, res) {
