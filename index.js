@@ -1225,6 +1225,18 @@ app.post('/api/hospitalizaciones/:id/monitoreo', verificarToken, hospEscribe, ah
   res.json({ ok: true });
 }));
 
+// Medicamentos usados antes en hospitalización (última dosis/vía/instrucciones de cada uno)
+app.get('/api/hosp-medicamentos', verificarToken, hospEscribe, ah(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT t.producto, t.dosis, t.via, t.instrucciones
+     FROM hosp_tratamientos t
+     JOIN (SELECT MAX(id) AS id FROM hosp_tratamientos WHERE empresa_id=? GROUP BY producto) u ON u.id = t.id
+     ORDER BY t.producto LIMIT 500`,
+    [req.user.empresa_id]);
+  res.json({ ok: true, medicamentos: rows });
+}));
+
+
 app.post('/api/hospitalizaciones/:id/notas', verificarToken, hospEscribe, ah(async (req, res) => {
   if (!(await hospActiva(req, res))) return;
   const b = req.body || {};
