@@ -1168,6 +1168,54 @@ app.delete('/api/recetas/:id', verificarToken, requireRoles('propietario', 'vete
   res.json({ ok: true });
 }));
 
+
+// Crear ingreso
+app.post('/api/hospitalizaciones', async (req, res) => {
+  try {
+    const b = req.body;
+    if (!b.paciente_id || !b.motivo || !b.fecha_ingreso)
+      return res.status(400).json({ error: 'Faltan campos obligatorios' });
+    if (!b.consentimiento || !b.autorizante)
+      return res.status(400).json({ error: 'Falta consentimiento del propietario' });
+
+    const [act] = await pool.query(
+      "SELECT id, codigo FROM hospitalizaciones WHERE paciente_id=? AND estado='activa'", [b.paciente_id]);
+    if (act.length) return res.status(409).json({ error: 'Ya tiene una hospitalización activa', codigo: act[0].codigo });
+
+    const [r] = await pool.query(
+      `INSERT INTO hospitalizaciones
+      (paciente_id,fecha_ingreso,procedencia,veterinario,estado_inicial,area,jaula,peso_kg,
+       motivo,antecedentes,diagnostico,plan_inicial,consentimiento,autorizante,creado_por)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [b.paciente_id,b.fecha_ingreso,b.procedencia,b.veterinario,b.estado_inicial,b.area,b.jaula,
+       b.peso_kg||null,b.motivo,b.antecedentes,b.diagnostico,b.plan_inicial,1,b.autorizante,
+       req.user?.nombre || b.veterinario]); // AJUSTAR: usuario de sesión
+    const codigo = 'HOSP-' + String(r.insertId).padStart(4, '0');
+    await pool.query('UPDATE hospitalizaciones SET codigo=? WHERE id=?', [codigo, r.insertId]);
+    res.json({ ok: true, id: r.insertId, codigo });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Error al guardar' }); }
+});
+
+// Hospitalización activa de un paciente
+app.get('/api/pacientes/:id/hospitalizacion-activa', async (req, res) => {
+  const [rows] = await pool.query(
+    "SELECT * FROM hospitalizaciones WHERE paciente_id=? AND estado='activa' LIMIT 1", [req.params.id]);
+  res.json(rows[0] || null);
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // ── Salud del servicio ───────────────────────────────────────
 app.get('/', (req, res) => res.json({ ok: true, servicio: 'Vetcore API' }));
 
