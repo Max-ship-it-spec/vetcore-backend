@@ -1103,108 +1103,45 @@ app.delete('/api/historia-archivos/:id', verificarToken, requireRoles('propietar
   res.json({ ok: true });
 }));
  
-// Hospitalizaciones
 app.post('/api/hospitalizaciones', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const { paciente_id, historia_id, ingreso, area, motivo } = req.body || {};
-  if (!paciente_id) return res.status(400).json({ ok: false, error: 'Paciente obligatorio' });
-  const [ins] = await pool.query(
-    `INSERT INTO hospitalizaciones (empresa_id, paciente_id, historia_id, veterinario_id, ingreso, area, motivo)
-     VALUES (?,?,?,?,?,?,?)`,
-    [req.user.empresa_id, paciente_id, historia_id || null,
-     req.user.rol === 'veterinario' ? req.user.id : null,
-     ingreso ? String(ingreso).replace('T', ' ') : null, area || '', motivo || '']
-  );
-  res.json({ ok: true, id: ins.insertId });
+  const b = req.body || {}, eid = req.user.empresa_id;
+  if (!b.paciente_id || !b.motivo || !b.fecha_ingreso) return res.status(400).json({ ok: false, error: 'Faltan campos obligatorios' });
+  if (!b.consentimiento || !b.autorizante) return res.status(400).json({ ok: false, error: 'Falta consentimiento del propietario' });
+
+  const [pa] = await pool.query('SELECT id FROM pacientes WHERE id=? AND empresa_id=?', [b.paciente_id, eid]);
+  if (!pa.length) return res.status(404).json({ ok: false, error: 'Paciente no encontrado' });
+
+  const [act] = await pool.query("SELECT codigo FROM hospitalizaciones WHERE paciente_id=? AND empresa_id=? AND estado='activa'", [b.paciente_id, eid]);
+  if (act.length) return res.status(409).json({ ok: false, error: `Ya tiene una hospitalización activa (${act[0].codigo})` });
+
+  const [[u]] = await pool.query('SELECT nombre FROM usuarios WHERE id=?', [req.user.id]);
+  const [r] = await pool.query(
+    `INSERT INTO hospitalizaciones
+     (empresa_id,paciente_id,historia_id,fecha_ingreso,procedencia,veterinario,estado_inicial,area,jaula,peso_kg,
+      motivo,antecedentes,diagnostico,plan_inicial,consentimiento,autorizante,creado_por)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
+    [eid, b.paciente_id, b.historia_id || null, b.fecha_ingreso, b.procedencia || 'consulta', b.veterinario || '',
+     b.estado_inicial || 'Estable', b.area || '', b.jaula || '', b.peso_kg || null,
+     b.motivo, b.antecedentes || '', b.diagnostico || '', b.plan_inicial || '', b.autorizante, u?.nombre || '']);
+  const codigo = 'HOSP-' + String(r.insertId).padStart(4, '0');
+  await pool.query('UPDATE hospitalizaciones SET codigo=? WHERE id=?', [codigo, r.insertId]);
+  res.json({ ok: true, id: r.insertId, codigo });
 }));
- 
+
+app.get('/api/pacientes/:id/hospitalizacion-activa', verificarToken, requireEmpresa, ah(async (req, res) => {
+  const [rows] = await pool.query(
+    "SELECT * FROM hospitalizaciones WHERE paciente_id=? AND empresa_id=? AND estado='activa' LIMIT 1",
+    [req.params.id, req.user.empresa_id]);
+  res.json({ ok: true, hospitalizacion: rows[0] || null });
+}));
+
 app.get('/api/hospitalizaciones', verificarToken, requireRoles('propietario', 'veterinario', 'recepcion'), ah(async (req, res) => {
   const [rows] = await pool.query(
     `SELECT h.*, pa.nombre AS paciente_nombre FROM hospitalizaciones h
      JOIN pacientes pa ON pa.id=h.paciente_id
-     WHERE h.empresa_id=? AND h.estado='activa' ORDER BY h.ingreso DESC`, [req.user.empresa_id]);
+     WHERE h.empresa_id=? AND h.estado='activa' ORDER BY h.fecha_ingreso DESC`, [req.user.empresa_id]);
   res.json({ ok: true, hospitalizaciones: rows });
 }));
-
-
-
-app.post('/api/recetas', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const { paciente_id, historia_id, fecha, prescripcion, indicaciones } = req.body || {};
-  if (!paciente_id) return res.status(400).json({ ok: false, error: 'Paciente obligatorio' });
-  const eid = req.user.empresa_id;
-  const [pa] = await pool.query('SELECT id FROM pacientes WHERE id=? AND empresa_id=?', [paciente_id, eid]);
-  if (!pa.length) return res.status(404).json({ ok: false, error: 'Paciente no encontrado' });
-  const [[{ n }]] = await pool.query('SELECT COALESCE(MAX(numero),0)+1 AS n FROM recetas WHERE empresa_id=?', [eid]);
-  const [ins] = await pool.query(
-    `INSERT INTO recetas (empresa_id, numero, paciente_id, historia_id, veterinario_id, fecha, prescripcion, indicaciones)
-     VALUES (?,?,?,?,?,?,?,?)`,
-    [eid, n, paciente_id, historia_id || null, req.user.rol === 'veterinario' ? req.user.id : null,
-     fecha || new Date().toISOString().slice(0, 10), prescripcion || '', indicaciones || '']
-  );
-  res.json({ ok: true, id: ins.insertId, numero: n });
-}));
- 
-// Sube la imagen PNG de la receta a Cloudinary
-app.post('/api/recetas/:id/imagen', verificarToken, requireRoles('propietario', 'veterinario'), upload.single('imagen'), ah(async (req, res) => {
-  if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió la imagen' });
-  const r = await subirACloudinary(req.file.buffer, 'vetcore/recetas');
-  const [u] = await pool.query('UPDATE recetas SET imagen_url=? WHERE id=? AND empresa_id=?', [r.secure_url, req.params.id, req.user.empresa_id]);
-  if (!u.affectedRows) return res.status(404).json({ ok: false, error: 'Receta no encontrada' });
-  res.json({ ok: true, imagen_url: r.secure_url });
-}));
- 
-// Recetas guardadas de un paciente (las últimas 10)
-app.get('/api/recetas', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT id, numero, paciente_id, historia_id, DATE_FORMAT(fecha,'%Y-%m-%d') AS fecha, imagen_url
-     FROM recetas WHERE empresa_id=? AND paciente_id=? AND imagen_url IS NOT NULL
-     ORDER BY id DESC LIMIT 10`,
-    [req.user.empresa_id, req.query.paciente_id || 0]
-  );
-  res.json({ ok: true, recetas: rows });
-}));
- 
-app.delete('/api/recetas/:id', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  await pool.query('DELETE FROM recetas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true });
-}));
-
-
-// Crear ingreso
-app.post('/api/hospitalizaciones', async (req, res) => {
-  try {
-    const b = req.body;
-    if (!b.paciente_id || !b.motivo || !b.fecha_ingreso)
-      return res.status(400).json({ error: 'Faltan campos obligatorios' });
-    if (!b.consentimiento || !b.autorizante)
-      return res.status(400).json({ error: 'Falta consentimiento del propietario' });
-
-    const [act] = await pool.query(
-      "SELECT id, codigo FROM hospitalizaciones WHERE paciente_id=? AND estado='activa'", [b.paciente_id]);
-    if (act.length) return res.status(409).json({ error: 'Ya tiene una hospitalización activa', codigo: act[0].codigo });
-
-    const [r] = await pool.query(
-      `INSERT INTO hospitalizaciones
-      (paciente_id,fecha_ingreso,procedencia,veterinario,estado_inicial,area,jaula,peso_kg,
-       motivo,antecedentes,diagnostico,plan_inicial,consentimiento,autorizante,creado_por)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [b.paciente_id,b.fecha_ingreso,b.procedencia,b.veterinario,b.estado_inicial,b.area,b.jaula,
-       b.peso_kg||null,b.motivo,b.antecedentes,b.diagnostico,b.plan_inicial,1,b.autorizante,
-       req.user?.nombre || b.veterinario]); // AJUSTAR: usuario de sesión
-    const codigo = 'HOSP-' + String(r.insertId).padStart(4, '0');
-    await pool.query('UPDATE hospitalizaciones SET codigo=? WHERE id=?', [codigo, r.insertId]);
-    res.json({ ok: true, id: r.insertId, codigo });
-  } catch (e) { console.error(e); res.status(500).json({ error: 'Error al guardar' }); }
-});
-
-// Hospitalización activa de un paciente
-app.get('/api/pacientes/:id/hospitalizacion-activa', async (req, res) => {
-  const [rows] = await pool.query(
-    "SELECT * FROM hospitalizaciones WHERE paciente_id=? AND estado='activa' LIMIT 1", [req.params.id]);
-  res.json(rows[0] || null);
-});
-
-
-
 
 
 
