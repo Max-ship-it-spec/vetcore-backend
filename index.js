@@ -1283,8 +1283,8 @@ app.post('/api/recetas', verificarToken, recRoles, ah(async (req, res) => {
   const [pa] = await pool.query('SELECT id FROM pacientes WHERE id=? AND empresa_id=?', [b.paciente_id, eid]);
   if (!pa.length) return res.status(404).json({ ok: false, error: 'Paciente no encontrado' });
   const [[{ n }]] = await pool.query('SELECT COALESCE(MAX(numero),0)+1 AS n FROM recetas WHERE empresa_id=?', [eid]);
-  const [r] = await pool.query(
-    `INSERT INTO recetas (empresa_id,paciente_id,historia_id,numero,fecha,prescripcion,indicaciones,creado_por)
+   const [r] = await pool.query(
+    `INSERT INTO recetas (empresa_id,paciente_id,historia_id,numero,fecha,prescripcion,indicaciones,veterinario_id)
      VALUES (?,?,?,?,?,?,?,?)`,
     [eid, b.paciente_id, b.historia_id || null, n, b.fecha, b.prescripcion || '', b.indicaciones || '', req.user.id]);
   res.json({ ok: true, id: r.insertId, numero: n });
