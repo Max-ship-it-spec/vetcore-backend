@@ -1158,6 +1158,42 @@ app.get('/api/hospitalizaciones', verificarToken, hospRoles, ah(async (req, res)
   res.json({ ok: true, hospitalizaciones: rows });
 }));
 
+app.post('/api/hospitalizaciones/:id/tratamientos', verificarToken, hospEscribe, ah(async (req, res) => {
+  if (!(await hospActiva(req, res))) return;
+  const b = req.body || {};
+  const horas = parseFloat(b.cada_horas) || 0, n = Math.min(Math.max(parseInt(b.num_dosis) || 1, 1), 60);
+  if (!String(b.producto || '').trim() || !b.primera) return res.status(400).json({ ok: false, error: 'Indica el medicamento y la hora de la primera dosis' });
+  if (n > 1 && horas <= 0) return res.status(400).json({ ok: false, error: 'Indica cada cuántas horas' });
+  const base = new Date(String(b.primera).replace(' ', 'T') + 'Z'); // se suma en UTC solo como aritmética de reloj
+  const grupo = 'T' + Date.now().toString(36), quien = await nombreUsuario(req.user.id);
+  const frec = n > 1 ? `cada ${horas} h × ${n}` : 'Dosis única';
+  const filas = Array.from({ length: n }, (_, i) => [
+    req.user.empresa_id, req.params.id, grupo, String(b.producto).trim(), b.dosis || '', b.via || '', frec, b.instrucciones || '',
+    new Date(base.getTime() + i * horas * 36e5).toISOString().slice(0, 19).replace('T', ' '), quien]);
+  await pool.query(
+    `INSERT INTO hosp_tratamientos (empresa_id,hospitalizacion_id,grupo,producto,dosis,via,frecuencia,instrucciones,programado,prescrito_por) VALUES ?`, [filas]);
+  res.json({ ok: true, dosis: n });
+}));
+
+app.put('/api/hosp-tratamientos/:id/estado', verificarToken, hospEscribe, ah(async (req, res) => {
+  const b = req.body || {};
+  if (!['realizado', 'no_administrado', 'omitido', 'cancelado'].includes(b.estado)) return res.status(400).json({ ok: false, error: 'Estado inválido' });
+  if (b.estado !== 'realizado' && !String(b.observaciones || '').trim()) return res.status(400).json({ ok: false, error: 'Indica el motivo' });
+  const [r] = await pool.query(
+    `UPDATE hosp_tratamientos t JOIN hospitalizaciones h ON h.id=t.hospitalizacion_id
+     SET t.estado=?, t.fecha_real=?, t.cantidad_real=?, t.observaciones=?, t.confirmado_por=?
+     WHERE t.id=? AND t.empresa_id=? AND t.estado='programado' AND h.estado='activa'`,
+    [b.estado, b.fecha_real || null, b.cantidad_real || '', b.observaciones || '', await nombreUsuario(req.user.id), req.params.id, req.user.empresa_id]);
+  if (!r.affectedRows) return res.status(400).json({ ok: false, error: 'Ese tratamiento ya fue registrado o la estancia está cerrada' });
+  res.json({ ok: true });
+}));
+
+
+  const [tratamientos] = await pool.query(
+    `SELECT *, ${FT('programado')} AS prog_txt, ${FT('fecha_real')} AS real_txt FROM hosp_tratamientos
+     WHERE hospitalizacion_id=? AND empresa_id=? ORDER BY programado ASC, id ASC`, [req.params.id, req.user.empresa_id]);
+  res.json({ ok: true, hospitalizacion: r[0], monitoreo, notas, tratamientos });
+
 app.get('/api/hospitalizaciones/:id', verificarToken, hospRoles, ah(async (req, res) => {
   const [r] = await pool.query(`${SEL_HOSP} WHERE h.id=? AND h.empresa_id=?`, [req.params.id, req.user.empresa_id]);
   if (!r[0]) return res.status(404).json({ ok: false, error: 'Hospitalización no encontrada' });
