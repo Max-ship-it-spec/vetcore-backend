@@ -1135,15 +1135,84 @@ app.get('/api/pacientes/:id/hospitalizacion-activa', verificarToken, requireEmpr
   res.json({ ok: true, hospitalizacion: rows[0] || null });
 }));
 
-app.get('/api/hospitalizaciones', verificarToken, requireRoles('propietario', 'veterinario', 'recepcion'), ah(async (req, res) => {
+const SEL_HOSP = `SELECT h.*,
+  DATE_FORMAT(h.fecha_ingreso,'%Y-%m-%dT%H:%i:%s') AS ingreso_txt,
+  DATE_FORMAT(h.fecha_alta,'%Y-%m-%dT%H:%i:%s') AS alta_txt,
+  DATE_FORMAT(h.proximo_control,'%Y-%m-%d') AS control_txt,
+  pa.nombre AS paciente_nombre, pa.especie, pa.raza, pa.foto_url,
+  c.nombre AS cliente_nombre, c.telefono AS cliente_telefono
+  FROM hospitalizaciones h
+  JOIN pacientes pa ON pa.id=h.paciente_id
+  JOIN clientes c ON c.id=pa.cliente_id`;
+const hospRoles = requireRoles('propietario', 'veterinario', 'recepcion');
+const hospEscribe = requireRoles('propietario', 'veterinario');
+const FT = (c) => `DATE_FORMAT(${c},'%Y-%m-%dT%H:%i:%s')`;
+const nombreUsuario = async (id) => (await pool.query('SELECT nombre FROM usuarios WHERE id=?', [id]))[0][0]?.nombre || '';
+
+app.get('/api/hospitalizaciones', verificarToken, hospRoles, ah(async (req, res) => {
+  const e = req.query.estado;
+  const filtro = e === 'activa' || e === 'alta' ? ' AND h.estado=?' : '';
+  const params = [req.user.empresa_id]; if (filtro) params.push(e);
   const [rows] = await pool.query(
-    `SELECT h.*, pa.nombre AS paciente_nombre FROM hospitalizaciones h
-     JOIN pacientes pa ON pa.id=h.paciente_id
-     WHERE h.empresa_id=? AND h.estado='activa' ORDER BY h.fecha_ingreso DESC`, [req.user.empresa_id]);
+    `${SEL_HOSP} WHERE h.empresa_id=?${filtro} ORDER BY (h.estado='activa') DESC, h.fecha_ingreso DESC`, params);
   res.json({ ok: true, hospitalizaciones: rows });
 }));
 
+app.get('/api/hospitalizaciones/:id', verificarToken, hospRoles, ah(async (req, res) => {
+  const [r] = await pool.query(`${SEL_HOSP} WHERE h.id=? AND h.empresa_id=?`, [req.params.id, req.user.empresa_id]);
+  if (!r[0]) return res.status(404).json({ ok: false, error: 'Hospitalización no encontrada' });
+  const [monitoreo] = await pool.query(
+    `SELECT *, ${FT('fecha')} AS fecha_txt FROM hosp_monitoreo WHERE hospitalizacion_id=? AND empresa_id=? ORDER BY fecha DESC, id DESC`,
+    [req.params.id, req.user.empresa_id]);
+  const [notas] = await pool.query(
+    `SELECT *, ${FT('fecha')} AS fecha_txt FROM hosp_notas WHERE hospitalizacion_id=? AND empresa_id=? ORDER BY fecha DESC, id DESC`,
+    [req.params.id, req.user.empresa_id]);
+  res.json({ ok: true, hospitalizacion: r[0], monitoreo, notas });
+}));
 
+async function hospActiva(req, res) {
+  const [r] = await pool.query("SELECT id FROM hospitalizaciones WHERE id=? AND empresa_id=? AND estado='activa'", [req.params.id, req.user.empresa_id]);
+  if (!r.length) { res.status(400).json({ ok: false, error: 'La hospitalización no existe o ya tiene alta' }); return false; }
+  return true;
+}
+
+app.post('/api/hospitalizaciones/:id/monitoreo', verificarToken, hospEscribe, ah(async (req, res) => {
+  if (!(await hospActiva(req, res))) return;
+  const b = req.body || {};
+  if (!b.fecha) return res.status(400).json({ ok: false, error: 'Falta la fecha' });
+  if (!b.temperatura && !b.fc && !b.fr && !b.mucosas && !b.observaciones)
+    return res.status(400).json({ ok: false, error: 'Registra al menos una medición' });
+  await pool.query(
+    `INSERT INTO hosp_monitoreo (empresa_id,hospitalizacion_id,fecha,temperatura,fc,fr,mucosas,dolor,hidratacion,observaciones,usuario)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    [req.user.empresa_id, req.params.id, b.fecha, b.temperatura || null, b.fc || '', b.fr || '', b.mucosas || '',
+     b.dolor || '', b.hidratacion || '', b.observaciones || '', await nombreUsuario(req.user.id)]);
+  res.json({ ok: true });
+}));
+
+app.post('/api/hospitalizaciones/:id/notas', verificarToken, hospEscribe, ah(async (req, res) => {
+  if (!(await hospActiva(req, res))) return;
+  const b = req.body || {};
+  if (!b.fecha || !String(b.nota || '').trim()) return res.status(400).json({ ok: false, error: 'Escribe la nota' });
+  await pool.query(
+    `INSERT INTO hosp_notas (empresa_id,hospitalizacion_id,fecha,tipo,nota,usuario) VALUES (?,?,?,?,?,?)`,
+    [req.user.empresa_id, req.params.id, b.fecha, ['evolucion', 'incidencia', 'relevo'].includes(b.tipo) ? b.tipo : 'evolucion',
+     String(b.nota).trim(), await nombreUsuario(req.user.id)]);
+  res.json({ ok: true });
+}));
+
+app.put('/api/hospitalizaciones/:id/alta', verificarToken, hospEscribe, ah(async (req, res) => {
+  if (!(await hospActiva(req, res))) return;
+  const b = req.body || {};
+  if (!b.fecha_alta || !b.condicion_alta || !String(b.resumen_alta || '').trim())
+    return res.status(400).json({ ok: false, error: 'Completa fecha, condición y resumen del alta' });
+  await pool.query(
+    `UPDATE hospitalizaciones SET estado='alta', fecha_alta=?, condicion_alta=?, resumen_alta=?, indicaciones_alta=?, proximo_control=?, alta_por=?
+     WHERE id=? AND empresa_id=?`,
+    [b.fecha_alta, b.condicion_alta, String(b.resumen_alta).trim(), b.indicaciones_alta || '', b.proximo_control || null,
+     await nombreUsuario(req.user.id), req.params.id, req.user.empresa_id]);
+  res.json({ ok: true });
+}));
 
 
 
