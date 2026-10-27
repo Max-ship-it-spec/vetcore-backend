@@ -1264,7 +1264,46 @@ app.put('/api/hospitalizaciones/:id/alta', verificarToken, hospEscribe, ah(async
   res.json({ ok: true });
 }));
 
+// ══════════════════════════════════════════════════════════════
+// RECETAS — propietario y veterinario
+// ══════════════════════════════════════════════════════════════
+const recRoles = requireRoles('propietario', 'veterinario');
 
+app.get('/api/recetas', verificarToken, recRoles, ah(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT id, numero, DATE_FORMAT(fecha,'%Y-%m-%d') AS fecha, prescripcion, indicaciones, imagen_url
+     FROM recetas WHERE empresa_id=? AND paciente_id=? AND imagen_url<>'' ORDER BY id DESC`,
+    [req.user.empresa_id, req.query.paciente_id]);
+  res.json({ ok: true, recetas: rows });
+}));
+
+app.post('/api/recetas', verificarToken, recRoles, ah(async (req, res) => {
+  const b = req.body || {}, eid = req.user.empresa_id;
+  if (!b.paciente_id || !b.fecha) return res.status(400).json({ ok: false, error: 'Paciente y fecha son obligatorios' });
+  const [pa] = await pool.query('SELECT id FROM pacientes WHERE id=? AND empresa_id=?', [b.paciente_id, eid]);
+  if (!pa.length) return res.status(404).json({ ok: false, error: 'Paciente no encontrado' });
+  const [[{ n }]] = await pool.query('SELECT COALESCE(MAX(numero),0)+1 AS n FROM recetas WHERE empresa_id=?', [eid]);
+  const [r] = await pool.query(
+    `INSERT INTO recetas (empresa_id,paciente_id,historia_id,numero,fecha,prescripcion,indicaciones,creado_por)
+     VALUES (?,?,?,?,?,?,?,?)`,
+    [eid, b.paciente_id, b.historia_id || null, n, b.fecha, b.prescripcion || '', b.indicaciones || '', req.user.id]);
+  res.json({ ok: true, id: r.insertId, numero: n });
+}));
+
+app.post('/api/recetas/:id/imagen', verificarToken, recRoles, upload.single('imagen'), ah(async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió la imagen' });
+  const [r] = await pool.query('SELECT id FROM recetas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
+  if (!r.length) return res.status(404).json({ ok: false, error: 'Receta no encontrada' });
+  const up = await subirACloudinary(req.file.buffer, 'vetcore/recetas');
+  await pool.query('UPDATE recetas SET imagen_url=? WHERE id=?', [up.secure_url, req.params.id]);
+
+  res.json({ ok: true, imagen_url: up.secure_url });
+}));
+
+app.delete('/api/recetas/:id', verificarToken, recRoles, ah(async (req, res) => {
+  await pool.query('DELETE FROM recetas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
+  res.json({ ok: true });
+}));
 
 
 
