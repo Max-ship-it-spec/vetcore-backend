@@ -1349,7 +1349,70 @@ app.delete('/api/recetas/:id', verificarToken, recRoles, ah(async (req, res) => 
   res.json({ ok: true });
 }));
 
+// ══════════════════════════════════════════════════════════════
+// REPORTES v2 — repositorio documental, ventas, movimientos
+// ══════════════════════════════════════════════════════════════
+// Repositorio: recetas + PDFs de laboratorio. El veterinario solo ve los suyos.
+app.get('/api/documentos', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
+  const eid = req.user.empresa_id, esVet = req.user.rol === 'veterinario';
+  const [[u]] = await pool.query('SELECT nombre FROM usuarios WHERE id=?', [req.user.id]);
+  const pr = [eid], pl = [eid];
+  let fr = '', fl = '';
+  if (esVet) { fr = ' AND r.veterinario_id=?'; pr.push(req.user.id); fl = ' AND h.atendio=?'; pl.push(u?.nombre || ''); }
+  const [rows] = await pool.query(
+    `SELECT * FROM (
+       SELECT 'receta' AS tipo, r.id, CONCAT('Receta Nº ', LPAD(r.numero,5,'0')) AS nombre, r.imagen_url AS url,
+              DATE_FORMAT(r.fecha,'%Y-%m-%d') AS fecha, r.paciente_id, r.historia_id,
+              pa.nombre AS paciente_nombre, c.nombre AS cliente_nombre, vu.nombre AS veterinario
+       FROM recetas r
+       JOIN pacientes pa ON pa.id=r.paciente_id
+       JOIN clientes c ON c.id=pa.cliente_id
+       LEFT JOIN usuarios vu ON vu.id=r.veterinario_id
+       WHERE r.empresa_id=? AND r.imagen_url<>''${fr}
+       UNION ALL
+       SELECT 'laboratorio' AS tipo, ha.id, ha.nombre, ha.url,
+              DATE_FORMAT(ha.created_at,'%Y-%m-%d') AS fecha, h.paciente_id, h.id AS historia_id,
+              pa.nombre AS paciente_nombre, c.nombre AS cliente_nombre, h.atendio AS veterinario
+       FROM historia_archivos ha
+       JOIN historias h ON h.id=ha.historia_id
+       JOIN pacientes pa ON pa.id=h.paciente_id
+       JOIN clientes c ON c.id=pa.cliente_id
+       WHERE ha.empresa_id=?${fl}
+     ) d ORDER BY fecha DESC, id DESC LIMIT 500`,
+    [...pr, ...pl]);
+  res.json({ ok: true, documentos: rows });
+}));
 
+// Informe de ventas y cobros (el veterinario solo ve las suyas)
+app.get('/api/reportes/ventas', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
+  const eid = req.user.empresa_id;
+  const valida = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+  const [[f]] = await pool.query(`SELECT DATE_FORMAT(CURDATE(),'%Y-%m-%d') AS hoy, DATE_FORMAT(CURDATE(),'%Y-%m-01') AS inicio`);
+  const desde = valida(req.query.desde) ? req.query.desde : f.inicio;
+  const hasta = valida(req.query.hasta) ? req.query.hasta : f.hoy;
+  const p = [eid, desde, hasta]; let fv = '';
+  if (req.user.rol === 'veterinario') { fv = ' AND veterinario_id=?'; p.push(req.user.id); }
+  const base = `FROM ventas WHERE empresa_id=? AND DATE(created_at) BETWEEN ? AND ?${fv}`;
+  const [porMetodo] = await pool.query(
+    `SELECT metodo_pago AS metodo, COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total ${base} AND estado_pago='pagado' GROUP BY metodo_pago`, p);
+  const [[pendiente]] = await pool.query(
+    `SELECT COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total ${base} AND estado_pago<>'pagado'`, p);
+  const [porDia] = await pool.query(
+    `SELECT DATE_FORMAT(created_at,'%Y-%m-%d') AS dia, COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total
+     ${base} AND estado_pago='pagado' GROUP BY DATE_FORMAT(created_at,'%Y-%m-%d') ORDER BY dia DESC`, p);
+  res.json({ ok: true, desde, hasta, porMetodo, pendiente, porDia });
+}));
+
+// Últimos movimientos de inventario (kardex general)
+app.get('/api/reportes/movimientos', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT m.*, p.nombre AS producto, u.nombre AS usuario_nombre
+     FROM movimientos_stock m
+     JOIN productos p ON p.id=m.producto_id
+     LEFT JOIN usuarios u ON u.id=m.usuario_id
+     WHERE m.empresa_id=? ORDER BY m.id DESC LIMIT 100`, [req.user.empresa_id]);
+  res.json({ ok: true, movimientos: rows });
+}));
 
 
 
