@@ -151,6 +151,7 @@ async function descontarVenta(conn, empresaId, productoId, cantidad, usuarioId) 
     await moverStock(conn, { empresaId, productoId, almacenId: f.almacen_id, delta: -tomar, tipo: 'venta', motivo: 'Venta', usuarioId });
     falta -= tomar;
   }
+  if (falta > 0) throw new Error('Stock insuficiente para completar la venta');
 }
 
 function datosProducto(b) {
@@ -892,46 +893,89 @@ app.post('/api/stock-documentos', verificarToken, requireRoles('propietario', 'r
 // ══════════════════════════════════════════════════════════════
 app.get('/api/ventas', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
   const [rows] = await pool.query(
-    `SELECT v.*, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre
+    `SELECT v.*, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre, vet.nombre AS veterinario_nombre
      FROM ventas v
      LEFT JOIN clientes c ON c.id = v.cliente_id
      LEFT JOIN pacientes pa ON pa.id = v.paciente_id
+     LEFT JOIN usuarios vet ON vet.id = v.veterinario_id
      WHERE v.empresa_id=? ORDER BY v.id DESC`, [req.user.empresa_id]
   );
   res.json({ ok: true, ventas: rows });
 }));
 
+
 app.post('/api/ventas', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const { cliente_id, paciente_id, items, descuento, metodo_pago, estado_pago } = req.body || {};
+    const { cliente_id, paciente_id, historia_id, items, descuento, metodo_pago, estado_pago,
+            referencia, tipo_tarjeta, recibido, cambio } = req.body || {};
     if (!Array.isArray(items) || !items.length) return res.status(400).json({ ok: false, error: 'Agrega al menos un producto o servicio' });
+    const eid = req.user.empresa_id;
 
     await conn.beginTransaction();
-    let subtotal = 0;
+    if (historia_id) {
+      const [dup] = await conn.query('SELECT id FROM ventas WHERE historia_id=? AND empresa_id=?', [historia_id, eid]);
+      if (dup.length) throw new Error('Esta consulta ya tiene una venta registrada');
+    }
+
+    let subtotal = 0; const lineas = [];
     for (const item of items) {
-      subtotal += Number(item.precio) * Number(item.cantidad || 1);
+      const cant = Math.max(1, parseInt(item.cantidad) || 1);
+      let nombre = item.nombre, precio = Number(item.precio) || 0;
       if (item.producto_id) {
-        await descontarVenta(conn, req.user.empresa_id, item.producto_id, Number(item.cantidad || 1), req.user.id);
+        const [[p]] = await conn.query('SELECT nombre, precio_venta FROM productos WHERE id=? AND empresa_id=?', [item.producto_id, eid]);
+        if (!p) throw new Error('Producto no encontrado');
+        nombre = p.nombre; precio = Number(p.precio_venta);
+        await descontarVenta(conn, eid, item.producto_id, cant, req.user.id);
       }
+      subtotal += precio * cant;
+      lineas.push({ producto_id: item.producto_id || null, nombre, precio, cantidad: cant });
     }
     const total = Math.max(subtotal - Number(descuento || 0), 0);
     const estado = estado_pago === 'pendiente' ? 'pendiente' : 'pagado';
+    const [[{ n }]] = await conn.query('SELECT COALESCE(MAX(numero),0)+1 AS n FROM ventas WHERE empresa_id=?', [eid]);
+
     const [result] = await conn.query(
-      `INSERT INTO ventas (empresa_id, cliente_id, paciente_id, items_json, subtotal, descuento, total, metodo_pago, estado_pago)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
-      [req.user.empresa_id, cliente_id || null, paciente_id || null, JSON.stringify(items),
-       subtotal, descuento || 0, total, metodo_pago || 'efectivo', estado]
+      `INSERT INTO ventas (empresa_id, numero, cliente_id, paciente_id, historia_id, veterinario_id, items_json, subtotal, descuento, total,
+                           metodo_pago, estado_pago, referencia, tipo_tarjeta, recibido, cambio)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [eid, n, cliente_id || null, paciente_id || null, historia_id || null,
+       req.user.rol === 'veterinario' ? req.user.id : null, JSON.stringify(lineas),
+       subtotal, descuento || 0, total, metodo_pago || 'efectivo', estado,
+       referencia || '', tipo_tarjeta || '', recibido ?? null, cambio ?? null]
     );
     await conn.commit();
-    res.json({ ok: true, id: result.insertId, total });
+    res.json({ ok: true, id: result.insertId, numero: n, total });
   } catch (e) {
     await conn.rollback();
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(400).json({ ok: false, error: e.message });
   } finally {
     conn.release();
   }
 });
+
+app.post('/api/ventas/:id/comprobante', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), upload.single('comprobante'), ah(async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió la imagen' });
+  const [r] = await pool.query('SELECT id FROM ventas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
+  if (!r.length) return res.status(404).json({ ok: false, error: 'Venta no encontrada' });
+  const up = await subirACloudinary(req.file.buffer, 'vetcore/comprobantes');
+  await pool.query('UPDATE ventas SET comprobante_url=? WHERE id=?', [up.secure_url, req.params.id]);
+  res.json({ ok: true, comprobante_url: up.secure_url });
+}));
+
+// Precios de servicios (Configuración): todos leen, solo propietario edita
+app.get('/api/servicios', verificarToken, requireEmpresa, ah(async (req, res) => {
+  const [rows] = await pool.query('SELECT nombre, precio FROM servicios WHERE empresa_id=? ORDER BY nombre', [req.user.empresa_id]);
+  res.json({ ok: true, servicios: rows });
+}));
+app.put('/api/servicios', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
+  const { nombre, precio } = req.body || {};
+  if (!nombre) return res.status(400).json({ ok: false, error: 'Nombre obligatorio' });
+  await pool.query(
+    'INSERT INTO servicios (empresa_id, nombre, precio) VALUES (?,?,?) ON DUPLICATE KEY UPDATE precio=VALUES(precio)',
+    [req.user.empresa_id, nombre, Number(precio) || 0]);
+  res.json({ ok: true });
+}));
 
 // "Registrar pago" de una venta que quedó pendiente
 app.put('/api/ventas/:id/pago', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
