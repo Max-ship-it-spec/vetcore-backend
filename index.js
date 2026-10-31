@@ -1,1427 +1,1535 @@
+const user = requireRole('propietario');
+document.getElementById('logoBox').innerHTML = logoSVG() + '<span class="vc-logo-text">Vet<span>core</span></span>';
+
+if (user) {
+  document.getElementById('userName').textContent = user.nombre_clinica || user.nombre || 'Mi clínica';
+  document.getElementById('userPlan').textContent = (user.plan_nombre || 'Sin plan');
+  document.getElementById('avatarLetter').textContent = iniciales(user.nombre_clinica || user.nombre || 'V');
+  document.getElementById('clinicaTag').textContent = user.plan_nombre ? user.plan_nombre : 'Mi clínica';
+}
+
 // ══════════════════════════════════════════════════════════════
-// VETCORE — Backend API (Node.js + Express + MySQL)
-// Modelo: 1 empresa (clínica) → cuentas de rol (propietario / veterinario / recepcion)
+// NAVEGACIÓN
 // ══════════════════════════════════════════════════════════════
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const pool = require('./db');
-const multer = require('multer');
-const cloudinary = require('cloudinary').v2;
+const titles = {
+  inicio: 'Inicio', clientes: 'Clientes', pacientes: 'Pacientes', agenda: 'Agenda',
+  historia: 'Historia clínica', ventas: 'Ventas', inventario: 'Inventario',
+  atencion: 'Atención', personal: 'Personal', caja: 'Finanzas / Caja', reportes: 'Reportes', config: 'Configuración'
+};
+document.querySelectorAll('.nav-item').forEach(btn => btn.addEventListener('click', () => ir(btn.dataset.sec)));
 
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
-});
+function ir(sec) {
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.getElementById('sec-' + sec).classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
+  document.querySelector(`.nav-item[data-sec="${sec}"]`).classList.add('active');
+  document.getElementById('pageTitle').textContent = titles[sec];
+  document.getElementById('sidebar').classList.remove('open');
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
-
-function subirACloudinary(buffer, folder) {
-  return new Promise((resolve, reject) => {
-    const stream = cloudinary.uploader.upload_stream(
-      { folder, resource_type: 'image' },
-      (err, result) => err ? reject(err) : resolve(result)
-    );
-    stream.end(buffer);
-  });
+  if (sec === 'inicio') cargarResumen();
+  if (sec === 'clientes') cargarClientes();
+  if (sec === 'pacientes') cargarPacientes();
+  if (sec === 'agenda') cargarCitas();
+  if (sec === 'historia') cargarSelectPacientesHistoria();
+  if (sec === 'ventas') cargarVentas();
+  if (sec === 'inventario') cargarProductos();
+  if (sec === 'atencion') cargarAtenciones();
+  if (sec === 'personal') cargarPersonal();
+  if (sec === 'caja') cargarCaja();
+  if (sec === 'reportes') cargarReportes();
+  if (sec === 'config') cargarConfiguracion();
 }
 
-const app = express();
-const JWT_SECRET = process.env.JWT_SECRET || 'cambia-esta-clave';
-
-app.use(cors());
-app.use(express.json());
-
-// ── Helpers ──────────────────────────────────────────────────
-// Envuelve los handlers async: si algo falla responde 500 en vez de dejar la petición colgada
-const ah = (fn) => (req, res, next) =>
-  Promise.resolve(fn(req, res, next)).catch((e) => {
-    console.error(e);
-    res.status(500).json({ ok: false, error: e.message });
-  });
-
-function firmarToken(usuario) {
-  return jwt.sign(
-    { id: usuario.id, rol: usuario.rol, empresa_id: usuario.empresa_id },
-    JWT_SECRET,
-    { expiresIn: '7d' }
-  );
+// ══════════════════════════════════════════════════════════════
+// VETERINARIOS (para asignar citas y atenciones)
+// ══════════════════════════════════════════════════════════════
+let _veterinarios = [];
+async function asegurarVeterinariosCargados() {
+  const d = await api('/api/veterinarios', { headers: authHeaders() });
+  _veterinarios = d.ok ? d.veterinarios : [];
+}
+function poblarSelectVeterinarios(selectId, valorSel) {
+  const sel = document.getElementById(selectId);
+  sel.innerHTML = '<option value="">— Sin asignar —</option>' +
+    _veterinarios.map(v => `<option value="${v.id}" ${String(v.id) === String(valorSel) ? 'selected' : ''}>${v.nombre}</option>`).join('');
 }
 
-function verificarToken(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ ok: false, error: 'No autenticado' });
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch (e) {
-    return res.status(401).json({ ok: false, error: 'Token inválido o expirado' });
-  }
+// ══════════════════════════════════════════════════════════════
+// CLIENTES
+// ══════════════════════════════════════════════════════════════
+let _clientes = [];
+async function cargarClientes() {
+  const d = await api('/api/clientes', { headers: authHeaders() });
+  _clientes = d.ok ? d.clientes : [];
+  renderClientes();
 }
-
-function requireAdmin(req, res, next) {
-  if (req.user.rol !== 'admin') return res.status(403).json({ ok: false, error: 'Solo el administrador puede hacer esto' });
-  next();
+function renderClientes() {
+  document.getElementById('tbClientes').innerHTML = _clientes.length
+    ? _clientes.map(c => `<tr>
+        <td><strong>${c.nombre}</strong></td>
+        <td>${c.telefono || '—'}</td>
+        <td>${c.email || '—'}</td>
+        <td>${c.documento || '—'}</td>
+        <td>
+          <div style="display:flex;gap:6px;">
+            <button class="btn btn-ghost btn-sm" onclick="abrirEditarCliente(${c.id})">Editar</button>
+            <button class="btn btn-danger btn-sm" onclick="eliminarCliente(${c.id})">Eliminar</button>
+          </div>
+        </td>
+      </tr>`).join('')
+    : '<tr class="empty-row"><td colspan="5">Aún no tienes clientes registrados</td></tr>';
 }
-
-// Cualquiera de las cuentas de una empresa (propietario/veterinario/recepcion)
-function requireEmpresa(req, res, next) {
-  if (!req.user.empresa_id) return res.status(403).json({ ok: false, error: 'Esta cuenta no pertenece a ninguna clínica' });
-  next();
+function abrirCrearCliente() {
+  document.getElementById('mClienteTitulo').textContent = 'Nuevo cliente';
+  document.getElementById('cl_id').value = '';
+  ['cl_nombre', 'cl_telefono', 'cl_email', 'cl_documento', 'cl_direccion'].forEach(id => document.getElementById(id).value = '');
+  abrirModal('mCliente');
 }
-
-// Restringe a roles específicos dentro de una empresa. Uso: requireRoles('propietario','recepcion')
-function requireRoles(...rolesPermitidos) {
-  return (req, res, next) => {
-    if (!req.user.empresa_id || !rolesPermitidos.includes(req.user.rol)) {
-      return res.status(403).json({ ok: false, error: 'Tu rol no tiene acceso a esta función' });
-    }
-    next();
+function abrirEditarCliente(id) {
+  const c = _clientes.find(x => x.id === id); if (!c) return;
+  document.getElementById('mClienteTitulo').textContent = 'Editar cliente';
+  document.getElementById('cl_id').value = c.id;
+  document.getElementById('cl_nombre').value = c.nombre || '';
+  document.getElementById('cl_telefono').value = c.telefono || '';
+  document.getElementById('cl_email').value = c.email || '';
+  document.getElementById('cl_documento').value = c.documento || '';
+  document.getElementById('cl_direccion').value = c.direccion || '';
+  abrirModal('mCliente');
+}
+async function guardarCliente() {
+  const id = document.getElementById('cl_id').value;
+  const body = {
+    nombre: document.getElementById('cl_nombre').value.trim(),
+    telefono: document.getElementById('cl_telefono').value.trim(),
+    email: document.getElementById('cl_email').value.trim(),
+    documento: document.getElementById('cl_documento').value.trim(),
+    direccion: document.getElementById('cl_direccion').value.trim(),
   };
+  if (!body.nombre) { toast('El nombre es obligatorio', 'rojo'); return; }
+  const d = await api(id ? `/api/clientes/${id}` : '/api/clientes', {
+    method: id ? 'PUT' : 'POST', headers: authHeaders(), body: JSON.stringify(body)
+  });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Cliente guardado', 'verde');
+  cerrarModal('mCliente');
+  cargarClientes();
 }
-
-async function usuarioPublico(row) {
-  const { password_hash, ...resto } = row;
-  return resto;
+async function eliminarCliente(id) {
+  if (!confirm('¿Eliminar este cliente? También se eliminarán sus mascotas.')) return;
+  const d = await api(`/api/clientes/${id}`, { method: 'DELETE', headers: authHeaders() });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Cliente eliminado', 'verde');
+  cargarClientes();
 }
-
-// Devuelve el id si es un veterinario activo de esa empresa, null si no se envió, false si es inválido
-async function vetValido(id, empresaId) {
-  if (!id) return null;
-  const [r] = await pool.query(
-    `SELECT id FROM usuarios WHERE id=? AND empresa_id=? AND rol='veterinario' AND activo=1`,
-    [id, empresaId]
-  );
-  return r.length ? Number(id) : false;
-}
-
-// Rango de fechas para caja y reportes. El propietario elige; los demás solo ven el día de hoy.
-async function resolverRango(req) {
-  const [[f]] = await pool.query(
-    `SELECT DATE_FORMAT(CURDATE(),'%Y-%m-%d') AS hoy, DATE_FORMAT(CURDATE(),'%Y-%m-01') AS inicio_mes`
-  );
-  const limitado = req.user.rol !== 'propietario';
-  const valida = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
-  let desde = f.hoy, hasta = f.hoy;
-  if (!limitado) {
-    desde = valida(req.query.desde) ? req.query.desde : f.inicio_mes;
-    hasta = valida(req.query.hasta) ? req.query.hasta : f.hoy;
+async function asegurarClientesCargados() {
+  if (!_clientes.length) {
+    const d = await api('/api/clientes', { headers: authHeaders() });
+    _clientes = d.ok ? d.clientes : [];
   }
-  return { desde, hasta, limitado };
 }
-// ── STOCK POR ALMACÉN ────────────────────────────────────────
-async function almacenPrincipal(db, empresaId) {
-  const [r] = await db.query(`SELECT id FROM almacenes WHERE empresa_id=? ORDER BY es_principal DESC, id ASC LIMIT 1`, [empresaId]);
-  if (r.length) return r[0].id;
-  const [ins] = await db.query(`INSERT INTO almacenes (empresa_id, nombre, es_principal) VALUES (?, 'Principal', 1)`, [empresaId]);
-  return ins.insertId;
+function poblarSelectClientes(selectId, valorSel) {
+  const sel = document.getElementById(selectId);
+  sel.innerHTML = '<option value="">— Selecciona un cliente —</option>' +
+    _clientes.map(c => `<option value="${c.id}" ${String(c.id) === String(valorSel) ? 'selected' : ''}>${c.nombre}</option>`).join('');
 }
 
-// Suma/resta stock en un almacén, mantiene productos.stock (total) y registra el kardex
-async function moverStock(conn, { empresaId, productoId, almacenId, delta, tipo, motivo, usuarioId, docId = null }) {
-  await conn.query(
-    `INSERT INTO stock_almacen (empresa_id, producto_id, almacen_id, stock) VALUES (?,?,?,0)
-     ON DUPLICATE KEY UPDATE stock = stock`, [empresaId, productoId, almacenId]);
-  const [[fila]] = await conn.query(
-    `SELECT stock FROM stock_almacen WHERE producto_id=? AND almacen_id=? FOR UPDATE`, [productoId, almacenId]);
-  if (Number(fila.stock) + delta < 0) throw new Error('Stock insuficiente en el almacén seleccionado');
-  await conn.query(`UPDATE stock_almacen SET stock = stock + ? WHERE producto_id=? AND almacen_id=?`, [delta, productoId, almacenId]);
-  await conn.query(`UPDATE productos SET stock = stock + ? WHERE id=? AND empresa_id=?`, [delta, productoId, empresaId]);
-  const [[p]] = await conn.query(`SELECT stock FROM productos WHERE id=?`, [productoId]);
-  await conn.query(
-    `INSERT INTO movimientos_stock (empresa_id, producto_id, almacen_id, tipo, cantidad, saldo, motivo, documento_id, usuario_id)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
-    [empresaId, productoId, almacenId, tipo, delta, p.stock, motivo || '', docId, usuarioId]);
+// ══════════════════════════════════════════════════════════════
+// PACIENTES
+// ══════════════════════════════════════════════════════════════
+let _pacientes = [];
+async function cargarPacientes() {
+  const d = await api('/api/pacientes', { headers: authHeaders() });
+  _pacientes = d.ok ? d.pacientes : [];
+  renderPacientes();
 }
-
-// Las ventas descuentan primero del almacén principal y luego de los demás
-async function descontarVenta(conn, empresaId, productoId, cantidad, usuarioId) {
-  let falta = Number(cantidad);
-  const [filas] = await conn.query(
-    `SELECT sa.almacen_id, sa.stock FROM stock_almacen sa JOIN almacenes a ON a.id = sa.almacen_id
-     WHERE sa.empresa_id=? AND sa.producto_id=? AND sa.stock>0 ORDER BY a.es_principal DESC, a.id ASC`,
-    [empresaId, productoId]);
-  for (const f of filas) {
-    if (falta <= 0) break;
-    const tomar = Math.min(falta, Number(f.stock));
-    await moverStock(conn, { empresaId, productoId, almacenId: f.almacen_id, delta: -tomar, tipo: 'venta', motivo: 'Venta', usuarioId });
-    falta -= tomar;
+function renderPacientes() {
+  document.getElementById('tbPacientes').innerHTML = _pacientes.length
+    ? _pacientes.map(p => `<tr>
+        <td>
+          ${p.foto_url ? `<img src="${p.foto_url}" class="avatar-mini">` : `<span class="avatar-mini-placeholder">🐾</span>`}
+          <a href="#" onclick="abrirFichaPaciente(${p.id});return false;" style="color:var(--primary-dark);font-weight:700;text-decoration:none;">${p.nombre}</a>
+        </td>
+        <td>${p.cliente_nombre}</td>
+        <td>${p.especie || '—'} ${p.raza ? '· ' + p.raza : ''}</td>
+        <td>${p.peso ? p.peso + ' kg' : '—'}</td>
+        <td>
+          <div style="display:flex;gap:6px;">
+            <button class="btn btn-ghost btn-sm" onclick="abrirEditarPaciente(${p.id})">Editar</button>
+            <button class="btn btn-danger btn-sm" onclick="eliminarPaciente(${p.id})">Eliminar</button>
+          </div>
+        </td>
+      </tr>`).join('')
+    : '<tr class="empty-row"><td colspan="5">Aún no tienes pacientes registrados</td></tr>';
+}
+async function asegurarPacientesCargados() {
+  if (!_pacientes.length) {
+    const d = await api('/api/pacientes', { headers: authHeaders() });
+    _pacientes = d.ok ? d.pacientes : [];
   }
-  if (falta > 0) throw new Error('Stock insuficiente para completar la venta');
 }
-
-function datosProducto(b) {
-  const cero = (x) => x === 0 || x === '0';
-  return {
-    nombre: String(b.nombre || '').trim(),
-    codigo_barras: b.codigo_barras || '', marca: b.marca || '', proveedor: b.proveedor || '',
-    linea: b.linea || '', categoria: b.categoria || '', subcategoria: b.subcategoria || '',
-    presentacion: b.presentacion || '', contenido: b.contenido || '', unidad_medida: b.unidad_medida || 'UND',
-    precio_compra: Number(b.precio_compra) || 0, precio_venta: Number(b.precio_venta) || 0,
-    stock_minimo: parseInt(b.stock_minimo) || 0, stock_maximo: parseInt(b.stock_maximo) || 0,
-    disponible_venta: cero(b.disponible_venta) ? 0 : 1,
-    frecuencia_dias: b.frecuencia_dias ? parseInt(b.frecuencia_dias) : null,
-    activo: cero(b.activo) ? 0 : 1,
+async function abrirCrearPaciente() {
+  await asegurarClientesCargados();
+  poblarSelectClientes('pa_cliente_id');
+  document.getElementById('mPacienteTitulo').textContent = 'Nueva mascota';
+  document.getElementById('pa_id').value = '';
+  ['pa_nombre', 'pa_especie', 'pa_raza', 'pa_fnac', 'pa_peso', 'pa_color', 'pa_microchip', 'pa_alergias', 'pa_observaciones'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('pa_sexo').value = '';
+  document.getElementById('pa_foto_preview_box').innerHTML = '<div class="pac-foto-placeholder">🐾</div>';
+  _pacienteFotoFile = null;
+  abrirModal('mPaciente');
+}
+async function abrirEditarPaciente(id) {
+  const p = _pacientes.find(x => x.id === id); if (!p) return;
+  await asegurarClientesCargados();
+  poblarSelectClientes('pa_cliente_id', p.cliente_id);
+  document.getElementById('mPacienteTitulo').textContent = 'Editar mascota';
+  document.getElementById('pa_id').value = p.id;
+  document.getElementById('pa_nombre').value = p.nombre || '';
+  document.getElementById('pa_especie').value = p.especie || '';
+  document.getElementById('pa_raza').value = p.raza || '';
+  document.getElementById('pa_sexo').value = p.sexo || '';
+  document.getElementById('pa_fnac').value = p.fecha_nacimiento ? String(p.fecha_nacimiento).slice(0, 10) : '';
+  document.getElementById('pa_peso').value = p.peso || '';
+  document.getElementById('pa_color').value = p.color || '';
+  document.getElementById('pa_microchip').value = p.microchip || '';
+  document.getElementById('pa_alergias').value = p.alergias || '';
+  document.getElementById('pa_observaciones').value = p.observaciones || '';
+  document.getElementById('pa_foto_preview_box').innerHTML = p.foto_url
+    ? `<img src="${p.foto_url}" class="pac-foto-preview">`
+    : '<div class="pac-foto-placeholder">🐾</div>';
+  _pacienteFotoFile = null;
+  abrirModal('mPaciente');
+}
+async function guardarPaciente() {
+  const id = document.getElementById('pa_id').value;
+  const cliente_id = document.getElementById('pa_cliente_id').value;
+  const body = {
+    cliente_id,
+    nombre: document.getElementById('pa_nombre').value.trim(),
+    especie: document.getElementById('pa_especie').value.trim(),
+    raza: document.getElementById('pa_raza').value.trim(),
+    sexo: document.getElementById('pa_sexo').value,
+    fecha_nacimiento: document.getElementById('pa_fnac').value || null,
+    peso: document.getElementById('pa_peso').value || null,
+    color: document.getElementById('pa_color').value.trim(),
+    microchip: document.getElementById('pa_microchip').value.trim(),
+    alergias: document.getElementById('pa_alergias').value.trim(),
+    observaciones: document.getElementById('pa_observaciones').value.trim(),
   };
+  if (!id && !cliente_id) { toast('Selecciona el propietario', 'rojo'); return; }
+  if (!body.nombre) { toast('El nombre de la mascota es obligatorio', 'rojo'); return; }
+  const d = await api(id ? `/api/pacientes/${id}` : '/api/pacientes', {
+    method: id ? 'PUT' : 'POST', headers: authHeaders(), body: JSON.stringify(body)
+  });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  const fotoOk = await subirFotoPacienteSiHay(id || d.id);
+  cerrarModal('mPaciente');
+  cargarPacientes();
+  if (fotoOk === false) return;
+  toast('Mascota guardada', 'verde');
+}
+async function eliminarPaciente(id) {
+  if (!confirm('¿Eliminar esta mascota? Se eliminará también su historia clínica.')) return;
+  const d = await api(`/api/pacientes/${id}`, { method: 'DELETE', headers: authHeaders() });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Mascota eliminada', 'verde');
+  cargarPacientes();
+}
+
+// ══════════════════════════════════════════════════════════════
+// AGENDA
+// ══════════════════════════════════════════════════════════════
+let _citas = [];
+let _agMes = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+let _agDiaSel = '';
+const MESES = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+const DIAS = ['Lun','Mar','Mié','Jue','Vie','Sáb','Dom'];
+const ESTADOS_CITA = ['pendiente', 'confirmada', 'en_espera', 'atendiendo', 'atendida', 'no_asistio', 'cancelada'];
+const estadoBadge = { pendiente: 'b-grey', confirmada: 'b-primary', en_espera: 'b-accent', atendiendo: 'b-accent', atendida: 'b-primary', cancelada: 'b-danger', no_asistio: 'b-danger' };
+const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const fechaCita = (c) => {
+  const f = String(c.fecha || '');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(f)) return f;
+  const d = new Date(f);
+  return isNaN(d) ? f.slice(0, 10) : ymd(d);
+};
+
+async function cargarCitas() {
+  const [d] = await Promise.all([
+    api('/api/citas', { headers: authHeaders() }),
+    asegurarVeterinariosCargados(),
+    asegurarClientesCargados(),
+  ]);
+  _citas = d.ok ? d.citas : [];
+  renderCalendario();
+  renderCitas();
+}
+
+function agVista(v) {
+  document.getElementById('ag_cal_wrap').style.display = v === 'cal' ? '' : 'none';
+  document.getElementById('ag_lista_wrap').style.display = v === 'lista' ? '' : 'none';
+  document.getElementById('ag_btn_cal').className = 'btn btn-sm ' + (v === 'cal' ? 'btn-primary' : 'btn-ghost');
+  document.getElementById('ag_btn_lista').className = 'btn btn-sm ' + (v === 'lista' ? 'btn-primary' : 'btn-ghost');
+}
+function agMes(delta) {
+  _agMes = new Date(_agMes.getFullYear(), _agMes.getMonth() + delta, 1);
+  renderCalendario();
+}
+function agHoy() {
+  const h = new Date();
+  _agMes = new Date(h.getFullYear(), h.getMonth(), 1);
+  renderCalendario();
+}
+
+function renderCalendario() {
+  const y = _agMes.getFullYear(), m = _agMes.getMonth();
+  document.getElementById('cal_titulo').textContent = `${MESES[m]} ${y}`;
+  const grid = document.getElementById('cal_grid');
+  grid.style.cssText = 'display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-top:14px;';
+
+  const porDia = {};
+  _citas.forEach(c => { const f = fechaCita(c); (porDia[f] = porDia[f] || []).push(c); });
+
+  const offset = (new Date(y, m, 1).getDay() + 6) % 7; // semana empieza en lunes
+  const diasMes = new Date(y, m + 1, 0).getDate();
+  const hoy = ymd(new Date());
+
+  let html = DIAS.map(d => `<div style="text-align:center;font-size:12px;font-weight:700;color:var(--ink-soft);padding:4px 0;">${d}</div>`).join('');
+  for (let i = 0; i < offset; i++) html += '<div></div>';
+  for (let d = 1; d <= diasMes; d++) {
+    const f = `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    const n = (porDia[f] || []).length;
+    const esHoy = f === hoy;
+    html += `<div onclick="abrirDiaAgenda('${f}')" style="cursor:pointer;min-height:70px;padding:6px 8px;border:1px solid ${esHoy ? 'var(--primary,#0f6b4f)' : 'var(--border)'};border-radius:10px;background:${n ? 'rgba(15,107,79,.08)' : '#fff'};">
+      <div style="font-size:13px;font-weight:${esHoy ? 800 : 600};">${d}</div>
+      ${n ? `<span class="badge b-primary" style="margin-top:6px;display:inline-block;">${n} cita${n > 1 ? 's' : ''}</span>` : ''}
+    </div>`;
+  }
+  grid.innerHTML = html;
+}
+
+function abrirDiaAgenda(f) {
+  _agDiaSel = f;
+  const citas = _citas.filter(c => fechaCita(c) === f).sort((a, b) => String(a.hora).localeCompare(String(b.hora)));
+  document.getElementById('mDiaTitulo').textContent = 'Citas del ' + fmtFecha(f);
+  document.getElementById('mDiaSub').textContent = citas.length ? `${citas.length} cita(s)` : '';
+  document.getElementById('mDiaCont').innerHTML = citas.length
+    ? citas.map(c => `
+      <div class="inicio-list-item">
+        <span class="inicio-hora">${c.hora ? c.hora.slice(0, 5) : '—'}</span>
+        <span style="flex:1;">${c.paciente_nombre || '—'} (${c.cliente_nombre || '—'})${c.veterinario_nombre ? ' · ' + c.veterinario_nombre : ''} — ${c.motivo || 'Consulta'}</span>
+        <span class="badge ${estadoBadge[c.estado] || 'b-grey'}">${(c.estado || '').replace('_', ' ')}</span>
+        <button class="btn btn-ghost btn-sm" onclick="whatsappCita(${c.id})" style="color:#25D366;font-weight:700;">WhatsApp</button>
+      </div>`).join('')
+    : '<p style="color:var(--ink-soft);font-size:13px;">No hay citas este día.</p>';
+  abrirModal('mDiaAgenda');
+}
+function nuevaCitaDia() {
+  cerrarModal('mDiaAgenda');
+  abrirCrearCita(_agDiaSel);
+}
+
+function renderCitas() {
+  const lista = [..._citas].sort((a, b) => (fechaCita(a) + String(a.hora)).localeCompare(fechaCita(b) + String(b.hora)));
+  document.getElementById('tbCitas').innerHTML = lista.length
+    ? lista.map(c => `<tr>
+        <td>${fmtFecha(c.fecha)}</td>
+        <td>${c.hora ? c.hora.slice(0, 5) : '—'}</td>
+        <td>${c.cliente_nombre || '—'}</td>
+        <td>${c.paciente_nombre || '—'}</td>
+        <td>${c.veterinario_nombre || '—'}</td>
+        <td>${c.motivo || '—'}</td>
+        <td>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <select onchange="cambiarEstadoCita(${c.id}, this.value)" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);font-size:12px;">
+              ${ESTADOS_CITA.map(e => `<option value="${e}" ${e === c.estado ? 'selected' : ''}>${e.replace('_', ' ')}</option>`).join('')}
+            </select>
+            <button class="btn btn-ghost btn-sm" title="Enviar recordatorio por WhatsApp" onclick="whatsappCita(${c.id})" style="color:#25D366;font-weight:700;">WhatsApp</button>
+          </div>
+        </td>
+        <td><button class="btn btn-danger btn-sm" onclick="eliminarCita(${c.id})">Eliminar</button></td>
+      </tr>`).join('')
+    : '<tr class="empty-row"><td colspan="8">No hay citas agendadas</td></tr>';
+}
+
+function telefonoWhatsApp(raw) {
+  let n = String(raw || '').replace(/\D/g, '');
+  if (!n) return '';
+  if (n.startsWith('593')) return n;
+  if (n.startsWith('0')) n = n.slice(1);
+  return '593' + n; // Ecuador
+}
+
+function whatsappCita(id) {
+  const c = _citas.find(x => x.id === id); if (!c) return;
+  const cli = _clientes.find(x => String(x.id) === String(c.cliente_id)) || _clientes.find(x => x.nombre === c.cliente_nombre);
+  const tel = telefonoWhatsApp(c.cliente_telefono || cli?.telefono);
+  if (!tel) { toast('Este cliente no tiene teléfono registrado', 'rojo'); return; }
+
+  const clinica = (user && user.nombre_clinica) || 'la clínica veterinaria';
+  const cliente = c.cliente_nombre || '';
+  const mascota = c.paciente_nombre || 'su mascota';
+  const fecha = fmtFecha(c.fecha);
+  const hora = c.hora ? c.hora.slice(0, 5) : '';
+  const cuando = hora ? `el ${fecha} a las ${hora}` : `el ${fecha}`;
+
+  const mensajes = {
+    pendiente:  `Hola ${cliente} 👋, le recordamos la cita de *${mascota}* ${cuando} en ${clinica}. ¿Nos confirma su asistencia? 🐾`,
+    confirmada: `Hola ${cliente} 👋, su cita para *${mascota}* está confirmada para ${cuando} en ${clinica}. ¡Los esperamos! 🐾`,
+    en_espera:  `Hola ${cliente}, *${mascota}* está en lista de espera en ${clinica}. En breve será atendido. 🐾`,
+    atendiendo: `Hola ${cliente}, *${mascota}* está siendo atendido en este momento en ${clinica}. Le avisaremos cuando termine. 🐾`,
+    atendida:   `Hola ${cliente} 👋, la atención de *${mascota}* del ${fecha} ya está completa ✅. Gracias por confiar en ${clinica}. Cualquier duda, escríbanos. 🐾`,
+    cancelada:  `Hola ${cliente}, la cita de *${mascota}* (${cuando}) fue cancelada. Si desea reagendar, escríbanos y con gusto le ayudamos. 🐾`,
+    no_asistio: `Hola ${cliente}, notamos que no pudo asistir a la cita de *${mascota}* (${cuando}). ¿Desea reagendarla? 🐾`,
+  };
+
+  const texto = mensajes[c.estado] || mensajes.pendiente;
+  window.open(`https://wa.me/${tel}?text=${encodeURIComponent(texto)}`, '_blank');
+}
+async function poblarPacientesDeCliente(selectId, clienteId) {
+  await Promise.all([asegurarClientesCargados(), asegurarPacientesCargados()]);
+  const sel = document.getElementById(selectId);
+  const lista = clienteId ? _pacientes.filter(p => String(p.cliente_id) === String(clienteId)) : [];
+  sel.innerHTML = '<option value="">— Sin mascota —</option>' +
+    lista.map(p => `<option value="${p.id}">${p.nombre}</option>`).join('');
+}
+async function abrirCrearCita(fecha) {
+  await Promise.all([asegurarClientesCargados(), asegurarVeterinariosCargados()]);
+  poblarSelectClientes('ci_cliente_id');
+  poblarSelectVeterinarios('ci_veterinario_id');
+  document.getElementById('ci_paciente_id').innerHTML = '<option value="">— Selecciona un cliente primero —</option>';
+  ['ci_hora', 'ci_motivo', 'ci_notas'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('ci_fecha').value = typeof fecha === 'string' ? fecha : '';
+  abrirModal('mCita');
+}
+async function guardarCita() {
+  const body = {
+    cliente_id: document.getElementById('ci_cliente_id').value || null,
+    paciente_id: document.getElementById('ci_paciente_id').value || null,
+    veterinario_id: document.getElementById('ci_veterinario_id').value || null,
+    fecha: document.getElementById('ci_fecha').value,
+    hora: document.getElementById('ci_hora').value || null,
+    motivo: document.getElementById('ci_motivo').value.trim(),
+    notas: document.getElementById('ci_notas').value.trim(),
+  };
+  if (!body.fecha) { toast('La fecha es obligatoria', 'rojo'); return; }
+  const d = await api('/api/citas', { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Cita agendada', 'verde');
+  cerrarModal('mCita');
+  cargarCitas();
+}
+async function cambiarEstadoCita(id, estado) {
+  const d = await api(`/api/citas/${id}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ estado }) });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Estado actualizado', 'verde');
+  cargarCitas();
+}
+async function eliminarCita(id) {
+  if (!confirm('¿Eliminar esta cita?')) return;
+  const d = await api(`/api/citas/${id}`, { method: 'DELETE', headers: authHeaders() });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Cita eliminada', 'verde');
+  cargarCitas();
+}
+
+// ══════════════════════════════════════════════════════════════
+// HISTORIA CLÍNICA
+// ══════════════════════════════════════════════════════════════
+let _pacienteHistoriaActivo = null;
+async function cargarSelectPacientesHistoria() {
+  await asegurarPacientesCargados();
+  const sel = document.getElementById('hc_paciente_select');
+  sel.innerHTML = '<option value="">— Elige una mascota —</option>' +
+    _pacientes.map(p => `<option value="${p.id}">${p.nombre} — ${p.cliente_nombre}</option>`).join('');
+}
+async function cargarHistoriaPaciente() {
+  const id = document.getElementById('hc_paciente_select').value;
+  _pacienteHistoriaActivo = id || null;
+  const wrap = document.getElementById('hc_wrap');
+  if (!id) { wrap.innerHTML = '<p style="color:var(--ink-soft);font-size:13.5px;">Elige un paciente para ver o registrar su historia clínica.</p>'; return; }
+
+  wrap.innerHTML = '<p style="color:var(--ink-soft);font-size:13.5px;">Cargando...</p>';
+  const d = await api(`/api/historias/${id}`, { headers: authHeaders() });
+  const historias = d.ok ? d.historias : [];
+  const paciente = _pacientes.find(p => String(p.id) === String(id));
+
+  wrap.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px;">
+      <div><strong>${paciente?.nombre || ''}</strong> <span style="color:var(--ink-soft);font-size:13px;">— ${paciente?.especie || ''} ${paciente?.raza ? '· ' + paciente.raza : ''}</span></div>
+      <button class="btn btn-primary btn-sm" onclick="abrirNuevaConsulta()">+ Nueva consulta</button>
+    </div>
+    <div id="hc_lista">
+      ${historias.length ? historias.map(h => `
+        <div style="border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:10px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+            <strong style="font-size:13.5px;">${fmtFecha(h.fecha)}${h.motivo ? ' — ' + h.motivo : ''}</strong>
+            <button class="btn btn-danger btn-sm" onclick="eliminarConsulta(${h.id})">Eliminar</button>
+          </div>
+          <div style="font-size:13px;color:var(--ink-soft);line-height:1.7;">
+            ${h.peso ? `<div><strong>Peso:</strong> ${h.peso} kg</div>` : ''}
+            ${h.temperatura ? `<div><strong>Temp:</strong> ${h.temperatura} °C</div>` : ''}
+            ${h.diagnostico ? `<div><strong>Diagnóstico:</strong> ${h.diagnostico}</div>` : ''}
+            ${h.tratamiento ? `<div><strong>Tratamiento:</strong> ${h.tratamiento}</div>` : ''}
+            ${h.medicamentos ? `<div><strong>Medicamentos:</strong> ${h.medicamentos}</div>` : ''}
+            ${h.recomendaciones ? `<div><strong>Recomendaciones:</strong> ${h.recomendaciones}</div>` : ''}
+            ${h.proximo_control ? `<div><strong>Próximo control:</strong> ${fmtFecha(h.proximo_control)}</div>` : ''}
+          </div>
+        </div>
+      `).join('') : '<p style="color:var(--ink-soft);font-size:13.5px;">Sin consultas registradas aún.</p>'}
+    </div>
+  `;
+}
+function abrirNuevaConsulta() {
+  if (!_pacienteHistoriaActivo) return;
+  document.getElementById('mConsultaSub').textContent = 'Registro de historia clínica';
+  ['hc_fecha', 'hc_proximo', 'hc_motivo', 'hc_anamnesis', 'hc_peso', 'hc_temp', 'hc_fc', 'hc_fr', 'hc_diagnostico', 'hc_tratamiento', 'hc_medicamentos', 'hc_recomendaciones']
+    .forEach(id => document.getElementById(id).value = '');
+  document.getElementById('hc_fecha').value = new Date().toISOString().slice(0, 10);
+  abrirModal('mConsulta');
+}
+async function guardarConsulta() {
+  const body = {
+    paciente_id: _pacienteHistoriaActivo,
+    fecha: document.getElementById('hc_fecha').value,
+    proximo_control: document.getElementById('hc_proximo').value || null,
+    motivo: document.getElementById('hc_motivo').value.trim(),
+    anamnesis: document.getElementById('hc_anamnesis').value.trim(),
+    peso: document.getElementById('hc_peso').value || null,
+    temperatura: document.getElementById('hc_temp').value || null,
+    fc: document.getElementById('hc_fc').value.trim(),
+    fr: document.getElementById('hc_fr').value.trim(),
+    diagnostico: document.getElementById('hc_diagnostico').value.trim(),
+    tratamiento: document.getElementById('hc_tratamiento').value.trim(),
+    medicamentos: document.getElementById('hc_medicamentos').value.trim(),
+    recomendaciones: document.getElementById('hc_recomendaciones').value.trim(),
+  };
+  if (!body.fecha) { toast('La fecha es obligatoria', 'rojo'); return; }
+  const d = await api('/api/historias', { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Consulta registrada', 'verde');
+  cerrarModal('mConsulta');
+  cargarHistoriaPaciente();
+}
+async function eliminarConsulta(id) {
+  if (!confirm('¿Eliminar esta consulta del historial?')) return;
+  const d = await api(`/api/historias/${id}`, { method: 'DELETE', headers: authHeaders() });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Consulta eliminada', 'verde');
+  cargarHistoriaPaciente();
+}
+
+// ══════════════════════════════════════════════════════════════
+// INVENTARIO (catálogo, cargas, descargas, stock por almacén)
+// ══════════════════════════════════════════════════════════════
+let _productos = [];
+let _almacenes = [];
+let _sdTipo = 'carga';
+let _sdItems = [];
+
+function invTab(t) {
+  document.querySelectorAll('.inv-tab').forEach(b => b.classList.toggle('active', b.dataset.inv === t));
+  document.querySelectorAll('.inv-view').forEach(v => v.classList.toggle('active', v.id === 'inv-' + t));
+  if (t === 'catalogo') cargarProductos();
+  if (t === 'descargas') cargarStockDocs('descarga');
+  if (t === 'cargas') cargarStockDocs('carga');
+  if (t === 'almacen') cargarStockAlmacen();
+}
+async function cargarAlmacenes() {
+  const d = await api('/api/almacenes', { headers: authHeaders() });
+  _almacenes = d.ok ? d.almacenes : [];
+}
+
+// ── Catálogo ──
+function llenarFiltro(selId, label, valores) {
+  const sel = document.getElementById(selId);
+  const actual = sel.value;
+  sel.innerHTML = `<option value="">${label}</option>` + valores.map(v => `<option value="${v}">${v}</option>`).join('');
+  sel.value = valores.includes(actual) ? actual : '';
+}
+const unicos = (k) => [...new Set(_productos.map(p => p[k]).filter(Boolean))].sort();
+async function cargarProductos() {
+  const d = await api('/api/productos', { headers: authHeaders() });
+  _productos = d.ok ? d.productos : [];
+  llenarFiltro('inv_f_proveedor', 'Proveedor...', unicos('proveedor'));
+  llenarFiltro('inv_f_linea', 'Línea...', unicos('linea'));
+  llenarFiltro('inv_f_categoria', 'Categorías...', unicos('categoria'));
+  [['dl_proveedor', 'proveedor'], ['dl_linea', 'linea'], ['dl_categoria', 'categoria']].forEach(([id, k]) => {
+    document.getElementById(id).innerHTML = unicos(k).map(v => `<option value="${v}">`).join('');
+  });
+  renderProductos();
+}
+function estadoStock(p) {
+  if (Number(p.stock) <= 0) return 'agotado';
+  if (Number(p.stock) <= Number(p.stock_minimo)) return 'bajo';
+  return 'ok';
+}
+// Pide a Cloudinary una versión pequeña y optimizada (más rápida que la original)
+function thumb(url, size) {
+  return url && url.includes('/upload/')
+    ? url.replace('/upload/', `/upload/w_${size},h_${size},c_fill,q_auto,f_auto/`)
+    : url;
+}
+function codigoSis(p) { return 'P' + String(p.id).padStart(5, '0'); }
+function renderProductos() {
+  const q = document.getElementById('inv_buscar').value.trim().toLowerCase();
+  const fp = document.getElementById('inv_f_proveedor').value;
+  const fl = document.getElementById('inv_f_linea').value;
+  const fs = document.getElementById('inv_f_stock').value;
+  const fc = document.getElementById('inv_f_categoria').value;
+  const lista = _productos.filter(p =>
+    (!q || [p.nombre, p.codigo_barras, p.marca].some(x => String(x || '').toLowerCase().includes(q))) &&
+    (!fp || p.proveedor === fp) && (!fl || p.linea === fl) && (!fc || p.categoria === fc) &&
+    (!fs || estadoStock(p) === fs));
+  document.getElementById('tbProductos').innerHTML = lista.length
+    ? lista.map(p => {
+        const es = estadoStock(p);
+        const stockHtml = `<span class="badge ${es === 'ok' ? 'b-primary' : es === 'bajo' ? 'b-accent' : 'b-danger'}">${p.stock}</span>`;
+        const estado = !p.activo ? '<span class="badge b-grey">Inactivo</span>'
+          : es === 'agotado' ? '<span class="badge b-danger">Agotado</span>'
+          : es === 'bajo' ? '<span class="badge b-accent">Stock bajo</span>'
+          : '<span class="badge b-primary">Disponible</span>';
+        return `<tr>
+          <td>${codigoSis(p)}</td>
+          <td>
+            <div class="prod-cell">
+              ${p.foto_url
+                ? `<a href="${p.foto_url}" target="_blank" title="Ver foto completa"><img src="${thumb(p.foto_url, 104)}" class="prod-foto" loading="lazy"></a>`
+                : `<span class="prod-foto-ph">📦</span>`}
+              <span class="prod-nombre">${p.nombre}</span>
+            </div>
+          </td>
+          <td>${p.marca || '—'}</td>
+          <td>${p.proveedor || '—'}</td>
+          <td>${p.linea || '—'}</td>
+          <td>${fmtMoney(p.precio_venta)}</td>
+          <td>${stockHtml}</td>
+          <td>${estado}</td>
+          <td><div style="display:flex;gap:6px;">
+            <button class="btn btn-ghost btn-sm" onclick="abrirEditarProducto(${p.id})">Editar</button>
+            <button class="btn btn-ghost btn-sm" onclick="abrirEditarProducto(${p.id});prTab('kardex')">Kardex</button>
+            <button class="btn btn-danger btn-sm" onclick="eliminarProducto(${p.id})">Eliminar</button>
+          </div></td>
+        </tr>`;
+      }).join('')
+    : '<tr class="empty-row"><td colspan="10" style="text-align:center;">Sin productos en el inventario</td></tr>';
+}
+function limpiarFiltrosInv() {
+  ['inv_buscar', 'inv_f_proveedor', 'inv_f_linea', 'inv_f_stock', 'inv_f_categoria'].forEach(id => document.getElementById(id).value = '');
+  renderProductos();
+}
+
+// ── Modal producto ──
+const PR_CAMPOS = ['nombre', 'marca', 'presentacion', 'contenido', 'proveedor', 'linea', 'categoria', 'subcategoria', 'precio_compra', 'precio_venta', 'stock_minimo', 'stock_maximo', 'frecuencia'];
+function abrirCrearProducto() {
+  document.getElementById('mProductoTitulo').textContent = 'Nuevo producto';
+  document.getElementById('pr_id').value = '';
+  PR_CAMPOS.forEach(c => document.getElementById('pr_' + c).value = '');
+  document.getElementById('pr_unidad').value = 'UND';
+  document.getElementById('pr_disponible').value = '1';
+  document.getElementById('pr_activo').value = '1';
+  document.getElementById('pr_stock_inicial').value = 0;
+  document.getElementById('pr_grp_actual').style.display = 'none';
+  document.getElementById('pr_grp_inicial').style.display = '';
+    document.getElementById('pr_foto_preview_box').innerHTML = '<div class="prod-foto-lg-ph">📦</div>';
+  _productoFotoFile = null;
+  prTab('editar');
+  abrirModal('mProducto');
+}
+function abrirEditarProducto(id) {
+  const p = _productos.find(x => x.id === id); if (!p) return;
+  document.getElementById('mProductoTitulo').textContent = 'Editar producto';
+  document.getElementById('pr_id').value = p.id;
+  document.getElementById('pr_nombre').value = p.nombre || '';
+  document.getElementById('pr_marca').value = p.marca || '';
+  document.getElementById('pr_presentacion').value = p.presentacion || '';
+  document.getElementById('pr_contenido').value = p.contenido || '';
+  document.getElementById('pr_unidad').value = p.unidad_medida || 'UND';
+  document.getElementById('pr_proveedor').value = p.proveedor || '';
+  document.getElementById('pr_linea').value = p.linea || '';
+  document.getElementById('pr_categoria').value = p.categoria || '';
+  document.getElementById('pr_subcategoria').value = p.subcategoria || '';
+  document.getElementById('pr_precio_compra').value = p.precio_compra ?? '';
+  document.getElementById('pr_precio_venta').value = p.precio_venta ?? '';
+  document.getElementById('pr_stock_actual').value = p.stock ?? 0;
+  document.getElementById('pr_stock_minimo').value = p.stock_minimo ?? '';
+  document.getElementById('pr_stock_maximo').value = p.stock_maximo ?? '';
+  document.getElementById('pr_frecuencia').value = p.frecuencia_dias ?? '';
+  document.getElementById('pr_disponible').value = p.disponible_venta ? '1' : '0';
+  document.getElementById('pr_activo').value = p.activo ? '1' : '0';
+  document.getElementById('pr_grp_actual').style.display = '';
+  document.getElementById('pr_grp_inicial').style.display = 'none';
+    document.getElementById('pr_foto_preview_box').innerHTML = p.foto_url
+    ? `<img src="${thumb(p.foto_url, 240)}" class="prod-foto-lg">`
+    : '<div class="prod-foto-lg-ph">📦</div>';
+  _productoFotoFile = null;
+  prTab('editar');
+  abrirModal('mProducto');
 }
 
 
 
-// ── AUTH ─────────────────────────────────────────────────────
-// Login único: cada cuenta (admin, propietario, veterinario, recepcion) tiene su propio email+password
-app.post('/api/auth/login', ah(async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ ok: false, error: 'Email y contraseña requeridos' });
+let _kardexMov = [];
+let _kardexProd = null;
 
-  const [rows] = await pool.query(
-    `SELECT u.*, e.nombre_clinica, e.activo AS empresa_activa, p.nombre AS plan_nombre, p.modulos AS plan_modulos
-     FROM usuarios u
-     LEFT JOIN empresas e ON e.id = u.empresa_id
-     LEFT JOIN planes p ON p.id = e.plan_id
-     WHERE u.email=? LIMIT 1`, [email]
-  );
-  const usuario = rows[0];
-  if (!usuario) return res.status(401).json({ ok: false, error: 'Credenciales incorrectas' });
-  if (!usuario.activo) return res.status(403).json({ ok: false, error: 'Esta cuenta está desactivada' });
-  if (usuario.empresa_id && !usuario.empresa_activa) return res.status(403).json({ ok: false, error: 'La clínica está desactivada' });
+async function prTab(t) {
+  document.getElementById('pr_tab_editar').classList.toggle('active', t === 'editar');
+  document.getElementById('pr_tab_kardex').classList.toggle('active', t === 'kardex');
+  document.getElementById('pr_panel_editar').style.display = t === 'editar' ? '' : 'none';
+  document.getElementById('pr_panel_kardex').style.display = t === 'kardex' ? '' : 'none';
+  if (t !== 'kardex') return;
 
-  const valido = await bcrypt.compare(password, usuario.password_hash);
-  if (!valido) return res.status(401).json({ ok: false, error: 'Credenciales incorrectas' });
-
-  const token = firmarToken(usuario);
-  res.json({ ok: true, token, usuario: await usuarioPublico(usuario) });
-}));
-
-app.get('/api/auth/me', verificarToken, ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT u.*, e.nombre_clinica, p.nombre AS plan_nombre, p.modulos AS plan_modulos
-     FROM usuarios u
-     LEFT JOIN empresas e ON e.id = u.empresa_id
-     LEFT JOIN planes p ON p.id = e.plan_id
-     WHERE u.id=? LIMIT 1`, [req.user.id]
-  );
-  if (!rows[0]) return res.status(404).json({ ok: false, error: 'No encontrado' });
-  res.json({ ok: true, usuario: await usuarioPublico(rows[0]) });
-}));
-
-// Cambiar la propia contraseña (cualquier cuenta)
-app.put('/api/auth/password', verificarToken, ah(async (req, res) => {
-  const { actual, nueva } = req.body || {};
-  if (!actual || !nueva || String(nueva).length < 6) {
-    return res.status(400).json({ ok: false, error: 'La nueva contraseña debe tener al menos 6 caracteres' });
+  const id = document.getElementById('pr_id').value;
+  const tb = document.getElementById('tbKardex');
+  if (!id) {
+    document.getElementById('kx_head').innerHTML = '';
+    document.getElementById('kx_stats').innerHTML = '';
+    tb.innerHTML = '<tr class="empty-row"><td colspan="8">Guarda el producto para ver su kardex</td></tr>';
+    return;
   }
-  const [rows] = await pool.query('SELECT password_hash FROM usuarios WHERE id=?', [req.user.id]);
-  if (!rows[0] || !(await bcrypt.compare(actual, rows[0].password_hash || ''))) {
-    return res.status(400).json({ ok: false, error: 'La contraseña actual no es correcta' });
-  }
-  const hash = await bcrypt.hash(String(nueva), 10);
-  await pool.query('UPDATE usuarios SET password_hash=? WHERE id=?', [hash, req.user.id]);
-  res.json({ ok: true });
-}));
+  _kardexProd = _productos.find(x => String(x.id) === String(id)) || null;
+  tb.innerHTML = '<tr class="empty-row"><td colspan="8">Cargando...</td></tr>';
+  const d = await api(`/api/productos/${id}/kardex`, { headers: authHeaders() });
+  _kardexMov = (d.ok ? d.movimientos : []).slice()
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
-// ── PLANES (lectura pública para el formulario del admin) ─────
-app.get('/api/planes', ah(async (req, res) => {
-  const [rows] = await pool.query('SELECT * FROM planes ORDER BY precio ASC');
-  res.json({ ok: true, planes: rows });
-}));
+  // llenar filtro de almacenes
+  const almacenes = [...new Set(_kardexMov.map(m => m.almacen_nombre).filter(Boolean))];
+  const sel = document.getElementById('kx_f_almacen');
+  sel.innerHTML = '<option value="">Todos los almacenes</option>' + almacenes.map(a => `<option>${a}</option>`).join('');
+  document.getElementById('kx_f_tipo').value = '';
 
-// ══════════════════════════════════════════════════════════════
-// ADMIN — gestión de empresas (clínicas) y sus cuentas de rol
-// ══════════════════════════════════════════════════════════════
-app.get('/api/admin/empresas', verificarToken, requireAdmin, ah(async (req, res) => {
-  const [empresas] = await pool.query(
-    `SELECT e.*, p.nombre AS plan_nombre, p.precio AS plan_precio
-     FROM empresas e LEFT JOIN planes p ON p.id = e.plan_id
-     ORDER BY e.id DESC`
-  );
-  const [cuentas] = await pool.query(
-    `SELECT id, empresa_id, rol, nombre, email, activo FROM usuarios WHERE empresa_id IS NOT NULL`
-  );
-  const porEmpresa = empresas.map(e => ({ ...e, cuentas: cuentas.filter(c => c.empresa_id === e.id) }));
-  res.json({ ok: true, empresas: porEmpresa });
-}));
+  renderKardexResumen();
+  renderKardex();
+}
 
-app.get('/api/admin/stats', verificarToken, requireAdmin, ah(async (req, res) => {
-  const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM empresas`);
-  const [[{ activas }]] = await pool.query(`SELECT COUNT(*) AS activas FROM empresas WHERE activo=1`);
-  const [porPlan] = await pool.query(
-    `SELECT p.nombre AS plan, COUNT(*) AS total, SUM(p.precio) AS ingreso_mensual
-     FROM empresas e JOIN planes p ON p.id=e.plan_id
-     WHERE e.activo=1 GROUP BY p.id`
-  );
-  res.json({ ok: true, total, activas, porPlan });
-}));
+function kxFechaHora(v) {
+  const d = new Date(v);
+  if (isNaN(d)) return fmtFecha(v);
+  return d.toLocaleDateString('es-EC', { day: '2-digit', month: 'short', year: 'numeric' }) +
+    '<small>' + d.toLocaleTimeString('es-EC', { hour: '2-digit', minute: '2-digit' }) + '</small>';
+}
 
-// Crea una empresa nueva + su cuenta de propietario (obligatoria) + veterinario/recepcion (opcionales)
-app.post('/api/admin/empresas', verificarToken, requireAdmin, async (req, res) => {
-  const conn = await pool.getConnection();
+function renderKardexResumen() {
+  const p = _kardexProd;
+  const entradas = _kardexMov.filter(m => m.cantidad > 0).reduce((a, m) => a + Number(m.cantidad), 0);
+  const salidas = _kardexMov.filter(m => m.cantidad < 0).reduce((a, m) => a + Math.abs(Number(m.cantidad)), 0);
+  const ultimo = _kardexMov[0];
+
+  document.getElementById('kx_head').innerHTML = p ? `
+    <div class="kx-prod">
+      ${p.foto_url ? `<img src="${thumb(p.foto_url, 104)}" class="prod-foto">` : '<span class="prod-foto-ph">📦</span>'}
+      <div>
+        <div class="kx-prod-nombre">${p.nombre}</div>
+        <div class="kx-prod-meta">${codigoSis(p)}${p.marca ? ' · ' + p.marca : ''}${p.proveedor ? ' · ' + p.proveedor : ''}${p.linea ? ' · ' + p.linea : ''}</div>
+      </div>
+    </div>` : '';
+
+  const stock = p ? Number(p.stock) : (ultimo ? Number(ultimo.saldo) : 0);
+  const valor = p ? stock * Number(p.precio_compra || 0) : 0;
+  const es = p ? estadoStock(p) : 'ok';
+  const cls = es === 'ok' ? 'ok' : es === 'bajo' ? 'warn' : 'bad';
+
+  document.getElementById('kx_stats').innerHTML = `
+    <div class="kx-stat ${cls}"><span>Stock actual</span><strong>${stock}</strong>
+      <small>${p ? `Mín. ${p.stock_minimo ?? '—'} · Máx. ${p.stock_maximo ?? '—'}` : ''}</small></div>
+    <div class="kx-stat"><span>Total entradas</span><strong class="in">+${entradas}</strong><small>unidades ingresadas</small></div>
+    <div class="kx-stat"><span>Total salidas</span><strong class="out">−${salidas}</strong><small>unidades egresadas</small></div>
+    <div class="kx-stat"><span>Valor en inventario</span><strong>${fmtMoney(valor)}</strong>
+      <small>${p ? `Compra ${fmtMoney(p.precio_compra || 0)} · Venta ${fmtMoney(p.precio_venta || 0)}` : ''}</small></div>
+    <div class="kx-stat"><span>Movimientos</span><strong>${_kardexMov.length}</strong>
+      <small>${ultimo ? 'Último: ' + fmtFecha(ultimo.created_at) : 'Sin movimientos'}</small></div>`;
+}
+
+function kardexFiltrado() {
+  const tipo = document.getElementById('kx_f_tipo').value;
+  const alm = document.getElementById('kx_f_almacen').value;
+  return _kardexMov.filter(m =>
+    (!tipo || (tipo === 'entrada' ? m.cantidad > 0 : m.cantidad < 0)) &&
+    (!alm || m.almacen_nombre === alm));
+}
+
+function renderKardex() {
+  const tb = document.getElementById('tbKardex');
+  const lista = kardexFiltrado();
+  document.getElementById('kx_count').textContent = `${lista.length} de ${_kardexMov.length} movimientos`;
+  tb.innerHTML = lista.length
+    ? lista.map(x => {
+        const ent = x.cantidad > 0, c = Math.abs(Number(x.cantidad));
+        return `<tr>
+          <td class="kx-fecha">${kxFechaHora(x.created_at)}</td>
+          <td><span class="kx-tipo ${ent ? 'in' : 'out'}">${ent ? '↓' : '↑'} ${x.tipo || (ent ? 'entrada' : 'salida')}</span></td>
+          <td>${x.almacen_nombre || '—'}</td>
+          <td class="kx-num in">${ent ? '+' + c : ''}</td>
+          <td class="kx-num out">${!ent ? '−' + c : ''}</td>
+          <td class="kx-num kx-saldo">${x.saldo}</td>
+          <td>${x.motivo || '—'}</td>
+          <td>${x.usuario_nombre || '—'}</td>
+        </tr>`;
+      }).join('')
+    : '<tr class="empty-row"><td colspan="8">Sin movimientos</td></tr>';
+}
+
+function exportarKardex() {
+  const lista = kardexFiltrado();
+  if (!lista.length) { toast('No hay movimientos para exportar'); return; }
+  const esc = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+  const filas = [['Fecha', 'Tipo', 'Almacén', 'Cantidad', 'Saldo', 'Motivo', 'Usuario']]
+    .concat(lista.map(m => [new Date(m.created_at).toLocaleString('es-EC'), m.tipo, m.almacen_nombre, m.cantidad, m.saldo, m.motivo, m.usuario_nombre]));
+  const csv = '\ufeff' + filas.map(f => f.map(esc).join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  a.download = `kardex-${_kardexProd ? codigoSis(_kardexProd) : 'producto'}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+
+
+let _productoFotoFile = null;
+let _guardandoProducto = false;
+function previsualizarFotoProducto(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  _productoFotoFile = file;
+  const reader = new FileReader();
+  reader.onload = ev => {
+        document.getElementById('pr_foto_preview_box').innerHTML = `<img src="${ev.target.result}" class="prod-foto-lg">`;
+  };
+  reader.readAsDataURL(file);
+}
+async function subirFotoProductoSiHay(productoId) {
+  if (!_productoFotoFile) return true;
+  const fd = new FormData();
+  fd.append('foto', _productoFotoFile);
   try {
-    const { nombre_clinica, plan_id, propietario, veterinario, recepcion } = req.body || {};
-    if (!nombre_clinica || !plan_id || !propietario?.email || !propietario?.password) {
-      return res.status(400).json({ ok: false, error: 'Nombre de clínica, plan y los datos del propietario son obligatorios' });
-    }
-
-    const emails = [propietario, veterinario, recepcion].filter(Boolean).map(c => c.email);
-    const [dupes] = await conn.query('SELECT email FROM usuarios WHERE email IN (?)', [emails]);
-    if (dupes.length) return res.status(400).json({ ok: false, error: `Email ya registrado: ${dupes[0].email}` });
-
-    await conn.beginTransaction();
-
-    const [empresaResult] = await conn.query(
-      'INSERT INTO empresas (nombre_clinica, plan_id, activo) VALUES (?,?,1)',
-      [nombre_clinica, plan_id]
-    );
-    const empresaId = empresaResult.insertId;
-
-    async function crearCuenta(datos, rol) {
-      if (!datos?.email || !datos?.password) return null;
-      const hash = await bcrypt.hash(datos.password, 10);
-      const [r] = await conn.query(
-        'INSERT INTO usuarios (empresa_id, rol, nombre, email, telefono, password_hash, activo) VALUES (?,?,?,?,?,?,1)',
-        [empresaId, rol, datos.nombre || '', datos.email, datos.telefono || '', hash]
-      );
-      return r.insertId;
-    }
-
-    const propietarioId = await crearCuenta(propietario, 'propietario');
-    const veterinarioId = await crearCuenta(veterinario, 'veterinario');
-    const recepcionId = await crearCuenta(recepcion, 'recepcion');
-
-    await conn.commit();
-    res.json({ ok: true, empresa_id: empresaId, propietario_id: propietarioId, veterinario_id: veterinarioId, recepcion_id: recepcionId });
+    const res = await fetch(API + `/api/productos/${productoId}/foto`, {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + getToken() }, body: fd
+    });
+    const data = await res.json();
+    _productoFotoFile = null;
+    if (!data.ok) { toast('Error subiendo foto: ' + (data.error || 'desconocido'), 'rojo'); return false; }
+    return true;
   } catch (e) {
-    await conn.rollback();
-    res.status(500).json({ ok: false, error: e.message });
+    toast('Error de red subiendo la foto', 'rojo');
+    _productoFotoFile = null;
+    return false;
+  }
+}
+async function guardarProducto() {
+  if (_guardandoProducto) return;
+  const id = document.getElementById('pr_id').value;
+  const v = (c) => document.getElementById('pr_' + c).value.trim();
+  const body = {
+    nombre: v('nombre'), marca: v('marca'),
+    presentacion: v('presentacion'), contenido: v('contenido'), unidad_medida: v('unidad'),
+    proveedor: v('proveedor'), linea: v('linea'), categoria: v('categoria'), subcategoria: v('subcategoria'),
+    precio_compra: v('precio_compra') || 0, precio_venta: v('precio_venta') || 0,
+    stock_minimo: v('stock_minimo'), stock_maximo: v('stock_maximo'),
+    frecuencia_dias: v('frecuencia') || null,
+    disponible_venta: v('disponible'), activo: v('activo'),
+  };
+  if (!id) body.stock_inicial = v('stock_inicial') || 0;
+  if (!body.nombre || !body.linea || !body.categoria || body.stock_minimo === '' || body.stock_maximo === '') {
+    toast('Completa los campos obligatorios (*)', 'rojo'); return;
+  }
+  _guardandoProducto = true;
+  const btn = document.getElementById('pr_btn_guardar');
+  btn.disabled = true; btn.textContent = 'Guardando...';
+  try {
+    const d = await api(id ? `/api/productos/${id}` : '/api/productos', {
+      method: id ? 'PUT' : 'POST', headers: authHeaders(), body: JSON.stringify(body)
+    });
+    if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+    const fotoOk = await subirFotoProductoSiHay(id || d.id);
+    cerrarModal('mProducto');
+    cargarProductos();
+    if (fotoOk !== false) toast('Producto guardado', 'verde');
   } finally {
-    conn.release();
+    _guardandoProducto = false;
+    btn.disabled = false; btn.textContent = '+ Guardar cambios';
   }
-});
+}
+async function eliminarProducto(id) {
+  if (!confirm('¿Eliminar este producto del inventario?')) return;
+  const d = await api(`/api/productos/${id}`, { method: 'DELETE', headers: authHeaders() });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Producto eliminado', 'verde');
+  cargarProductos();
+}
 
-// Agrega una cuenta suelta a una empresa que ya existe
-app.post('/api/admin/empresas/:id/cuentas', verificarToken, requireAdmin, ah(async (req, res) => {
-  const { rol, nombre, email, telefono, password } = req.body || {};
-  if (!['propietario', 'veterinario', 'recepcion'].includes(rol)) return res.status(400).json({ ok: false, error: 'Rol inválido' });
-  if (!email || !password) return res.status(400).json({ ok: false, error: 'Email y contraseña son obligatorios' });
-  const [existe] = await pool.query('SELECT id FROM usuarios WHERE email=?', [email]);
-  if (existe.length) return res.status(400).json({ ok: false, error: 'Ese email ya está registrado' });
-  const hash = await bcrypt.hash(password, 10);
-  const [result] = await pool.query(
-    'INSERT INTO usuarios (empresa_id, rol, nombre, email, telefono, password_hash, activo) VALUES (?,?,?,?,?,?,1)',
-    [req.params.id, rol, nombre || '', email, telefono || '', hash]
-  );
-  res.json({ ok: true, id: result.insertId });
-}));
-
-app.put('/api/admin/cuentas/:id', verificarToken, requireAdmin, ah(async (req, res) => {
-  const { nombre, telefono, activo, password } = req.body || {};
-  await pool.query(
-    `UPDATE usuarios SET
-       nombre = COALESCE(?, nombre), telefono = COALESCE(?, telefono), activo = COALESCE(?, activo)
-     WHERE id=? AND rol != 'admin'`,
-    [nombre ?? null, telefono ?? null, (activo === undefined ? null : activo), req.params.id]
-  );
-  if (password) {
-    const hash = await bcrypt.hash(password, 10);
-    await pool.query(`UPDATE usuarios SET password_hash=? WHERE id=? AND rol != 'admin'`, [hash, req.params.id]);
+// ── Cargas / Descargas ──
+async function cargarStockDocs(tipo) {
+  const tb = document.getElementById(tipo === 'carga' ? 'tbCargas' : 'tbDescargas');
+  const d = await api(`/api/stock-documentos?tipo=${tipo}`, { headers: authHeaders() });
+  const docs = d.ok ? d.documentos : [];
+  tb.innerHTML = docs.length
+    ? docs.map(x => `<tr>
+        <td>${x.numero}</td><td>${fmtFecha(x.created_at)}</td><td>${x.motivo || '—'}</td>
+        <td>${x.almacen_nombre || '—'}</td><td>${x.responsable || '—'}</td>
+        <td>${tipo === 'carga' ? fmtMoney(x.total) : (x.registrado_por || '—')}</td>
+        <td><button class="btn btn-ghost btn-sm" onclick="verStockDoc(${x.id})">Ver</button></td>
+      </tr>`).join('')
+    : '<tr class="empty-row"><td colspan="7" style="text-align:center;">Sin registros</td></tr>';
+}
+async function abrirStockDoc(tipo) {
+  _sdTipo = tipo; _sdItems = [];
+  await Promise.all([cargarAlmacenes(), cargarProductos()]);
+  document.getElementById('sd_titulo').textContent = tipo === 'carga' ? 'Cargar stock' : 'Descargar stock';
+  document.getElementById('sd_lbl_almacen').textContent = tipo === 'carga' ? 'Almacén destino' : 'Almacén origen';
+  document.getElementById('sd_almacen').innerHTML = _almacenes.map(a => `<option value="${a.id}">${a.nombre}</option>`).join('');
+  const ops = tipo === 'carga' ? ['Compra a proveedor', 'Corrección', 'Donación', 'Otro'] : ['Corrección', 'Merma / vencido', 'Consumo interno', 'Otro'];
+  document.getElementById('sd_operacion').innerHTML = ops.map(o => `<option>${o}</option>`).join('');
+  ['sd_responsable', 'sd_motivo', 'sd_buscar'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('sd_resultados').style.display = 'none';
+  document.getElementById('sd_btn').textContent = tipo === 'carga' ? '+ Cargar' : '+ Descargar';
+  sdRender();
+  abrirModal('mStockDoc');
+}
+function sdBuscar(term) {
+  const box = document.getElementById('sd_resultados');
+  const q = term.trim().toLowerCase();
+  if (!q) { box.style.display = 'none'; return; }
+  const r = _productos.filter(p => String(p.nombre).toLowerCase().includes(q) || String(p.codigo_barras || '').toLowerCase().includes(q)).slice(0, 8);
+  box.innerHTML = r.length
+    ? r.map(p => `<div class="search-result-item" onclick="sdAgregar(${p.id})"><span>${p.nombre}</span><span style="color:var(--ink-soft);">stock: ${p.stock}</span></div>`).join('')
+    : '<div class="search-empty">Sin resultados</div>';
+  box.style.display = 'block';
+}
+function sdAgregar(id) {
+  const p = _productos.find(x => x.id === id); if (!p) return;
+  if (!_sdItems.find(i => i.producto_id === id)) {
+    _sdItems.push({ producto_id: p.id, codigo_barras: p.codigo_barras, nombre: p.nombre, precio_compra: p.precio_compra, precio_venta: p.precio_venta, cantidad: 1 });
   }
-  res.json({ ok: true });
-}));
-
-app.delete('/api/admin/cuentas/:id', verificarToken, requireAdmin, ah(async (req, res) => {
-  await pool.query(`DELETE FROM usuarios WHERE id=? AND rol != 'admin'`, [req.params.id]);
-  res.json({ ok: true });
-}));
-
-app.put('/api/admin/empresas/:id', verificarToken, requireAdmin, ah(async (req, res) => {
-  const { nombre_clinica, plan_id, activo } = req.body || {};
-  await pool.query(
-    `UPDATE empresas SET
-       nombre_clinica = COALESCE(?, nombre_clinica), plan_id = COALESCE(?, plan_id), activo = COALESCE(?, activo)
-     WHERE id=?`,
-    [nombre_clinica ?? null, plan_id ?? null, (activo === undefined ? null : activo), req.params.id]
-  );
-  res.json({ ok: true });
-}));
-
-app.delete('/api/admin/empresas/:id', verificarToken, requireAdmin, ah(async (req, res) => {
-  await pool.query('DELETE FROM usuarios WHERE empresa_id=?', [req.params.id]);
-  await pool.query('DELETE FROM empresas WHERE id=?', [req.params.id]);
-  res.json({ ok: true });
-}));
-
-// ══════════════════════════════════════════════════════════════
-// PERSONAL — el propietario ve y administra a su equipo (las cuentas las crea el admin)
-// ══════════════════════════════════════════════════════════════
-app.get('/api/personal', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT id, rol, nombre, email, activo FROM usuarios
-     WHERE empresa_id=? ORDER BY FIELD(rol,'propietario','veterinario','recepcion'), nombre`,
-    [req.user.empresa_id]
-  );
-  res.json({ ok: true, personal: rows });
-}));
-
-app.put('/api/personal/:id', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
-  const { nombre, activo, password } = req.body || {};
-  const [r] = await pool.query(
-    `UPDATE usuarios SET nombre = COALESCE(?, nombre), activo = COALESCE(?, activo)
-     WHERE id=? AND empresa_id=? AND rol IN ('veterinario','recepcion')`,
-    [nombre ?? null, (activo === undefined ? null : activo), req.params.id, req.user.empresa_id]
-  );
-  if (!r.affectedRows) return res.status(404).json({ ok: false, error: 'Cuenta no encontrada' });
-  if (password) {
-    const hash = await bcrypt.hash(String(password), 10);
-    await pool.query(
-      `UPDATE usuarios SET password_hash=? WHERE id=? AND empresa_id=? AND rol IN ('veterinario','recepcion')`,
-      [hash, req.params.id, req.user.empresa_id]
-    );
-  }
-  res.json({ ok: true });
-}));
-
-// Veterinarios activos de la clínica (para asignar citas y atenciones) — lo ven los 3 roles
-app.get('/api/veterinarios', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT id, nombre FROM usuarios WHERE empresa_id=? AND rol='veterinario' AND activo=1 ORDER BY nombre`,
-    [req.user.empresa_id]
-  );
-  res.json({ ok: true, veterinarios: rows });
-}));
-
-// ══════════════════════════════════════════════════════════════
-// CONFIGURACIÓN Y RESPALDO — solo propietario (lectura de configuración: todos)
-// ══════════════════════════════════════════════════════════════
-app.get('/api/configuracion', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT e.nombre_clinica, p.nombre AS plan_nombre
-     FROM empresas e LEFT JOIN planes p ON p.id = e.plan_id WHERE e.id=?`,
-    [req.user.empresa_id]
-  );
-  res.json({ ok: true, configuracion: rows[0] || {} });
-}));
-
-app.put('/api/configuracion', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
-  const nombre = String((req.body || {}).nombre_clinica || '').trim();
-  if (!nombre) return res.status(400).json({ ok: false, error: 'El nombre de la clínica es obligatorio' });
-  await pool.query('UPDATE empresas SET nombre_clinica=? WHERE id=?', [nombre, req.user.empresa_id]);
-  res.json({ ok: true, nombre_clinica: nombre });
-}));
-
-app.get('/api/respaldo', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
-  const tablas = ['clientes', 'pacientes', 'citas', 'historias', 'productos', 'ventas', 'atenciones'];
-  const datos = {};
-  for (const t of tablas) {
-    const [rows] = await pool.query(`SELECT * FROM ${t} WHERE empresa_id=?`, [req.user.empresa_id]);
-    datos[t] = rows;
-  }
-  res.setHeader('Content-Disposition', 'attachment; filename="respaldo-vetcore.json"');
-  res.json({ ok: true, generado: new Date().toISOString(), datos });
-}));
-
-// ══════════════════════════════════════════════════════════════
-// ATENCIONES — episodio central del flujo veterinario
-// El veterinario solo ve las atenciones que tiene asignadas.
-// ══════════════════════════════════════════════════════════════
-app.get('/api/atenciones', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const params = [req.user.empresa_id];
-  let filtro = '';
-  if (req.user.rol === 'veterinario') { filtro = ' AND a.veterinario_id=?'; params.push(req.user.id); }
-  const recientes = req.query.recientes === '1';
-  const [rows] = await pool.query(
-    `SELECT a.*, pa.nombre AS paciente_nombre, c.nombre AS cliente_nombre,
-            u.nombre AS staff_nombre, v.nombre AS veterinario_nombre
-     FROM atenciones a
-     JOIN pacientes pa ON pa.id=a.paciente_id
-     JOIN clientes c ON c.id=a.cliente_id
-     LEFT JOIN usuarios u ON u.id=a.staff_id
-     LEFT JOIN usuarios v ON v.id=a.veterinario_id
-     WHERE a.empresa_id=?${filtro}${recientes ? '' : " AND a.estado != 'cerrada'"}
-     ORDER BY ${recientes ? 'a.created_at DESC LIMIT 8' : "FIELD(a.prioridad,'emergencia','urgente','prioritario','normal'), a.created_at ASC"}`,
-    params
-  );
-  res.json({ ok: true, atenciones: rows });
-}));
-
-app.post('/api/atenciones', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const { paciente_id, cliente_id, cita_id, origen, prioridad, veterinario_id } = req.body || {};
-  if (!paciente_id || !cliente_id) return res.status(400).json({ ok: false, error: 'Paciente y cliente son obligatorios' });
-  // Si la crea un veterinario, queda asignada a él automáticamente
-  const vetId = req.user.rol === 'veterinario' ? req.user.id : await vetValido(veterinario_id, req.user.empresa_id);
-  if (vetId === false) return res.status(400).json({ ok: false, error: 'Veterinario no válido' });
-  const [result] = await pool.query(
-    `INSERT INTO atenciones (empresa_id, staff_id, veterinario_id, paciente_id, cliente_id, cita_id, origen, prioridad, estado)
-     VALUES (?,?,?,?,?,?,?,?, 'llegada')`,
-    [req.user.empresa_id, req.user.id, vetId, paciente_id, cliente_id, cita_id || null, origen || 'sin_cita', prioridad || 'normal']
-  );
-  res.json({ ok: true, id: result.insertId });
-}));
-
-// "Asignar veterinario" — recepción y propietario
-app.put('/api/atenciones/:id/asignar', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
-  const vetId = await vetValido((req.body || {}).veterinario_id, req.user.empresa_id);
-  if (vetId === false) return res.status(400).json({ ok: false, error: 'Veterinario no válido' });
-  await pool.query('UPDATE atenciones SET veterinario_id=? WHERE id=? AND empresa_id=?', [vetId, req.params.id, req.user.empresa_id]);
-  res.json({ ok: true });
-}));
-
-// Recepción no puede pasar la atención a las etapas clínicas (consulta, diagnóstico, tratamiento)
-app.put('/api/atenciones/:id/estado', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const { estado } = req.body || {};
-  const estadosValidos = ['llegada','triaje','espera','consulta','diagnostico','tratamiento','venta','seguimiento','cerrada'];
-  if (!estadosValidos.includes(estado)) return res.status(400).json({ ok: false, error: 'Estado inválido' });
-  if (req.user.rol === 'recepcion' && ['consulta','diagnostico','tratamiento'].includes(estado)) {
-    return res.status(403).json({ ok: false, error: 'Recepción no puede pasar la atención a etapas clínicas' });
-  }
-  const params = [estado, req.params.id, req.user.empresa_id];
-  let filtro = '';
-  if (req.user.rol === 'veterinario') { filtro = ' AND veterinario_id=?'; params.push(req.user.id); }
-  await pool.query(`UPDATE atenciones SET estado=? WHERE id=? AND empresa_id=?${filtro}`, params);
-  res.json({ ok: true });
-}));
-
-app.put('/api/atenciones/:id/vincular', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const { historia_id, venta_id } = req.body || {};
-  await pool.query(
-    `UPDATE atenciones SET historia_id=COALESCE(?,historia_id), venta_id=COALESCE(?,venta_id) WHERE id=? AND empresa_id=?`,
-    [historia_id || null, venta_id || null, req.params.id, req.user.empresa_id]
-  );
-  res.json({ ok: true });
-}));
-
-// ══════════════════════════════════════════════════════════════
-// CLIENTES — los 3 roles leen y crean/editan; borrar: propietario y recepción
-// ══════════════════════════════════════════════════════════════
-app.get('/api/clientes', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const [rows] = await pool.query('SELECT * FROM clientes WHERE empresa_id=? ORDER BY id DESC', [req.user.empresa_id]);
-  res.json({ ok: true, clientes: rows });
-}));
-
-app.post('/api/clientes', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
-  const { nombre, telefono, email, direccion, documento } = req.body || {};
-  if (!nombre) return res.status(400).json({ ok: false, error: 'El nombre es obligatorio' });
-  const [result] = await pool.query(
-    `INSERT INTO clientes (empresa_id, nombre, telefono, email, direccion, documento) VALUES (?,?,?,?,?,?)`,
-    [req.user.empresa_id, nombre, telefono || '', email || '', direccion || '', documento || '']
-  );
-  res.json({ ok: true, id: result.insertId });
-}));
-
-app.put('/api/clientes/:id', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
-  const { nombre, telefono, email, direccion, documento } = req.body || {};
-  await pool.query(
-    `UPDATE clientes SET nombre=?, telefono=?, email=?, direccion=?, documento=? WHERE id=? AND empresa_id=?`,
-    [nombre, telefono || '', email || '', direccion || '', documento || '', req.params.id, req.user.empresa_id]
-  );
-  res.json({ ok: true });
-}));
-
-app.delete('/api/clientes/:id', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
-  await pool.query('DELETE FROM clientes WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true });
-}));
-
-// ══════════════════════════════════════════════════════════════
-// PACIENTES (mascotas) — los 3 roles leen y crean/editan; borrar: propietario y recepción
-// ══════════════════════════════════════════════════════════════
-app.get('/api/pacientes', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT pa.*, c.nombre AS cliente_nombre, c.telefono AS cliente_telefono
-     FROM pacientes pa JOIN clientes c ON c.id = pa.cliente_id
-     WHERE pa.empresa_id=? ORDER BY pa.id DESC`, [req.user.empresa_id]
-  );
-  res.json({ ok: true, pacientes: rows });
-}));
-
-app.post('/api/pacientes/:id/foto', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), upload.single('foto'), ah(async (req, res) => {
-  if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió ninguna imagen' });
-  const result = await subirACloudinary(req.file.buffer, 'vetcore/pacientes');
-  await pool.query('UPDATE pacientes SET foto_url=? WHERE id=? AND empresa_id=?', [result.secure_url, req.params.id, req.user.empresa_id]);
-  res.json({ ok: true, foto_url: result.secure_url });
-}));
-
-app.post('/api/pacientes', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
-  const { cliente_id, nombre, especie, raza, sexo, fecha_nacimiento, peso, color, microchip, alergias, observaciones } = req.body || {};
-  if (!cliente_id || !nombre) return res.status(400).json({ ok: false, error: 'Propietario y nombre de la mascota son obligatorios' });
-  const [result] = await pool.query(
-    `INSERT INTO pacientes (empresa_id, cliente_id, nombre, especie, raza, sexo, fecha_nacimiento, peso, color, microchip, alergias, observaciones)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [req.user.empresa_id, cliente_id, nombre, especie || '', raza || '', sexo || '', fecha_nacimiento || null,
-     peso || null, color || '', microchip || '', alergias || '', observaciones || '']
-  );
-  res.json({ ok: true, id: result.insertId });
-}));
-
-app.put('/api/pacientes/:id', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
-  const { nombre, especie, raza, sexo, fecha_nacimiento, peso, color, microchip, alergias, observaciones } = req.body || {};
-  await pool.query(
-    `UPDATE pacientes SET nombre=?, especie=?, raza=?, sexo=?, fecha_nacimiento=?, peso=?, color=?, microchip=?, alergias=?, observaciones=?
-     WHERE id=? AND empresa_id=?`,
-    [nombre, especie || '', raza || '', sexo || '', fecha_nacimiento || null, peso || null,
-     color || '', microchip || '', alergias || '', observaciones || '', req.params.id, req.user.empresa_id]
-  );
-  res.json({ ok: true });
-}));
-
-app.delete('/api/pacientes/:id', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
-  await pool.query('DELETE FROM pacientes WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true });
-}));
-
-// ══════════════════════════════════════════════════════════════
-// AGENDA (citas) — propietario y recepción crean/editan.
-// El veterinario solo ve las citas asignadas a él.
-// Filtros: ?hoy=1  ?pendientes=1
-// ══════════════════════════════════════════════════════════════
-app.get('/api/citas', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const params = [req.user.empresa_id];
-  let filtro = '';
-  if (req.user.rol === 'veterinario') { filtro += ' AND ci.veterinario_id=?'; params.push(req.user.id); }
-  if (req.query.hoy === '1') filtro += ' AND ci.fecha = CURDATE()';
-  if (req.query.pendientes === '1') filtro += " AND ci.estado IN ('pendiente','confirmada') AND ci.fecha >= CURDATE()";
-  const [rows] = await pool.query(
-    `SELECT ci.*, c.nombre AS cliente_nombre, c.telefono AS cliente_telefono, pa.nombre AS paciente_nombre, v.nombre AS veterinario_nombre
-     FROM citas ci
-     LEFT JOIN clientes c ON c.id = ci.cliente_id
-     LEFT JOIN pacientes pa ON pa.id = ci.paciente_id
-     LEFT JOIN usuarios v ON v.id = ci.veterinario_id
-     WHERE ci.empresa_id=?${filtro} ORDER BY ci.fecha ASC, ci.hora ASC`, params
-  );
-  res.json({ ok: true, citas: rows });
-}));
-
-app.post('/api/citas', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
-  const { cliente_id, paciente_id, veterinario_id, fecha, hora, motivo, notas } = req.body || {};
-  if (!fecha) return res.status(400).json({ ok: false, error: 'La fecha es obligatoria' });
-  // Si lo crea un veterinario, la cita queda asignada a él
-  const vetId = req.user.rol === 'veterinario' ? req.user.id : await vetValido(veterinario_id, req.user.empresa_id);
-  if (vetId === false) return res.status(400).json({ ok: false, error: 'Veterinario no válido' });
-  const [result] = await pool.query(
-    `INSERT INTO citas (empresa_id, cliente_id, paciente_id, veterinario_id, fecha, hora, motivo, notas) VALUES (?,?,?,?,?,?,?,?)`,
-    [req.user.empresa_id, cliente_id || null, paciente_id || null, vetId, fecha, hora || null, motivo || '', notas || '']
-  );
-  res.json({ ok: true, id: result.insertId });
-}));
-
-app.put('/api/citas/:id', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
-  const { fecha, hora, motivo, notas, estado, veterinario_id } = req.body || {};
-  const vetId = await vetValido(veterinario_id, req.user.empresa_id);
-  if (vetId === false) return res.status(400).json({ ok: false, error: 'Veterinario no válido' });
-  await pool.query(
-    `UPDATE citas SET fecha=COALESCE(?,fecha), hora=COALESCE(?,hora), motivo=COALESCE(?,motivo), notas=COALESCE(?,notas),
-       estado=COALESCE(?,estado), veterinario_id=COALESCE(?,veterinario_id)
-     WHERE id=? AND empresa_id=?`,
-    [fecha ?? null, hora ?? null, motivo ?? null, notas ?? null, estado ?? null, vetId, req.params.id, req.user.empresa_id]
-  );
-  res.json({ ok: true });
-}));
-
-
-// El veterinario inicia / finaliza SU cita: pendiente → en proceso (atendiendo) → finalizado (atendida)
-// También sincroniza la atención vinculada (consulta → cerrada)
-app.put('/api/citas/:id/estado', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const { estado } = req.body || {};
-  if (!['atendiendo', 'atendida'].includes(estado)) return res.status(400).json({ ok: false, error: 'Estado inválido' });
-
-  const eid = req.user.empresa_id;
-  const params = [req.params.id, eid];
-  let filtro = '';
-  if (req.user.rol === 'veterinario') { filtro = ' AND veterinario_id=?'; params.push(req.user.id); }
-  const [rows] = await pool.query(`SELECT * FROM citas WHERE id=? AND empresa_id=?${filtro}`, params);
-  const cita = rows[0];
-  if (!cita) return res.status(404).json({ ok: false, error: 'Cita no encontrada' });
-  if (['cancelada', 'no_asistio'].includes(cita.estado)) {
-    return res.status(400).json({ ok: false, error: 'No se puede cambiar una cita cancelada' });
-  }
-
-  await pool.query('UPDATE citas SET estado=? WHERE id=?', [estado, cita.id]);
-
-  // Conexión con Atenciones
-  if (cita.paciente_id && cita.cliente_id) {
-    const [at] = await pool.query(
-      'SELECT id FROM atenciones WHERE cita_id=? AND empresa_id=? ORDER BY id DESC LIMIT 1', [cita.id, eid]);
-    const estadoAt = estado === 'atendiendo' ? 'consulta' : 'cerrada';
-    if (at.length) {
-      await pool.query('UPDATE atenciones SET estado=? WHERE id=?', [estadoAt, at[0].id]);
-    } else if (estado === 'atendiendo') {
-      await pool.query(
-        `INSERT INTO atenciones (empresa_id, staff_id, veterinario_id, paciente_id, cliente_id, cita_id, origen, prioridad, estado)
-         VALUES (?,?,?,?,?,?, 'con_cita', 'normal', 'consulta')`,
-        [eid, req.user.id, cita.veterinario_id || req.user.id, cita.paciente_id, cita.cliente_id, cita.id]);
-    }
-  }
-  res.json({ ok: true });
-}));
-
-
-app.delete('/api/citas/:id', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
-  await pool.query('DELETE FROM citas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true });
-}));
-
-// ── Búsqueda global ─────────────────────────────────────────
-app.get('/api/buscar', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const term = (req.query.q || '').trim();
-  if (!term) return res.json({ ok: true, clientes: [], pacientes: [] });
-  const like = `%${term}%`;
-  const [clientes] = await pool.query(
-    `SELECT id, nombre, telefono FROM clientes WHERE empresa_id=? AND (nombre LIKE ? OR telefono LIKE ?) LIMIT 6`,
-    [req.user.empresa_id, like, like]
-  );
-  const [pacientes] = await pool.query(
-    `SELECT pa.id, pa.nombre, pa.especie, c.nombre AS cliente_nombre
-     FROM pacientes pa JOIN clientes c ON c.id = pa.cliente_id
-     WHERE pa.empresa_id=? AND pa.nombre LIKE ? LIMIT 6`,
-    [req.user.empresa_id, like]
-  );
-  res.json({ ok: true, clientes, pacientes });
-}));
-
-// ══════════════════════════════════════════════════════════════
-// HISTORIA CLÍNICA — propietario y veterinario escriben.
-// Recepción solo consulta y NO ve diagnóstico, tratamiento ni medicamentos.
-// ══════════════════════════════════════════════════════════════
-app.get('/api/historias/:paciente_id', verificarToken, requireRoles('propietario', 'veterinario', 'recepcion'), ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT * FROM historias WHERE paciente_id=? AND empresa_id=? ORDER BY fecha DESC, id DESC`,
-    [req.params.paciente_id, req.user.empresa_id]
-  );
-  const historias = req.user.rol === 'recepcion'
-    ? rows.map(h => ({ ...h, diagnostico: '', tratamiento: '', medicamentos: '', datos_json: null }))
-    : rows;
-  res.json({ ok: true, historias });
-}));
-
-app.post('/api/historias', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const { paciente_id, fecha, motivo, anamnesis, peso, temperatura, fc, fr, diagnostico, tratamiento, medicamentos, recomendaciones, proximo_control, datos_json } = req.body || {};
-  if (!paciente_id || !fecha) return res.status(400).json({ ok: false, error: 'Paciente y fecha son obligatorios' });
-  const [[u]] = await pool.query('SELECT nombre FROM usuarios WHERE id=?', [req.user.id]);
-  const [result] = await pool.query(
-    `INSERT INTO historias (empresa_id, paciente_id, fecha, motivo, anamnesis, peso, temperatura, fc, fr, diagnostico, tratamiento, medicamentos, recomendaciones, proximo_control, datos_json, atendio)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [req.user.empresa_id, paciente_id, fecha, motivo || '', anamnesis || '', peso || null, temperatura || null,
-     fc || '', fr || '', diagnostico || '', tratamiento || '', medicamentos || '', recomendaciones || '', proximo_control || null,
-     datos_json || null, u?.nombre || '']
-  );
-  res.json({ ok: true, id: result.insertId });
-}));
-
-app.put('/api/historias/:id', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const { fecha, motivo, anamnesis, peso, temperatura, fc, fr, diagnostico, tratamiento, medicamentos, recomendaciones, proximo_control, datos_json } = req.body || {};
-  if (!fecha) return res.status(400).json({ ok: false, error: 'La fecha es obligatoria' });
-  await pool.query(
-    `UPDATE historias SET fecha=?, motivo=?, anamnesis=?, peso=?, temperatura=?, fc=?, fr=?, diagnostico=?, tratamiento=?, medicamentos=?, recomendaciones=?, proximo_control=?, datos_json=?
-     WHERE id=? AND empresa_id=?`,
-    [fecha, motivo || '', anamnesis || '', peso || null, temperatura || null, fc || '', fr || '', diagnostico || '',
-     tratamiento || '', medicamentos || '', recomendaciones || '', proximo_control || null, datos_json || null,
-     req.params.id, req.user.empresa_id]
-  );
-  res.json({ ok: true });
-}));
-
-app.delete('/api/historias/:id', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  await pool.query('DELETE FROM historias WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true });
-}));
-
-// ══════════════════════════════════════════════════════════════
-// INVENTARIO — propietario y recepción crean/editan; veterinario consulta; borrar: propietario
-// ══════════════════════════════════════════════════════════════
-app.get('/api/productos', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
-  const [rows] = await pool.query('SELECT * FROM productos WHERE empresa_id=? ORDER BY nombre ASC', [req.user.empresa_id]);
-  res.json({ ok: true, productos: rows });
-}));
-app.post('/api/productos', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
-  const conn = await pool.getConnection();
+  document.getElementById('sd_buscar').value = '';
+  document.getElementById('sd_resultados').style.display = 'none';
+  sdRender();
+}
+function sdSet(i, campo, val) { _sdItems[i][campo] = val; sdTotal(); }
+function sdQuitar(i) { _sdItems.splice(i, 1); sdRender(); }
+function sdTotal() {
+  const t = _sdItems.reduce((a, i) => a + (Number(i.precio_compra) || 0) * (parseInt(i.cantidad) || 0), 0);
+  document.getElementById('sd_total').textContent = _sdTipo === 'carga' && _sdItems.length ? 'Total compra: ' + fmtMoney(t) : '';
+}
+function sdRender() {
+  const carga = _sdTipo === 'carga';
+  document.getElementById('sd_items').innerHTML = _sdItems.length
+    ? _sdItems.map((it, i) => `<tr>
+        <td>${it.codigo_barras || '—'}</td><td>${it.nombre}</td>
+        <td>${carga ? `<input type="number" step="0.01" value="${it.precio_compra}" style="width:90px;" oninput="sdSet(${i},'precio_compra',this.value)">` : fmtMoney(it.precio_compra)}</td>
+        <td>${carga ? `<input type="number" step="0.01" value="${it.precio_venta}" style="width:90px;" oninput="sdSet(${i},'precio_venta',this.value)">` : fmtMoney(it.precio_venta)}</td>
+        <td style="text-align:center;"><input type="number" min="1" value="${it.cantidad}" style="width:70px;" oninput="sdSet(${i},'cantidad',this.value)"></td>
+        <td><button class="btn btn-danger btn-sm" onclick="sdQuitar(${i})">✕</button></td></tr>`).join('')
+    : '<tr class="empty-row"><td colspan="6" style="text-align:center;">Busca y agrega productos</td></tr>';
+  sdTotal();
+}
+let _guardandoDoc = false;
+async function sdGuardar() {
+  if (_guardandoDoc) return;
+  const body = {
+    tipo: _sdTipo,
+    almacen_id: document.getElementById('sd_almacen').value,
+    motivo: document.getElementById('sd_motivo').value.trim(),
+    tipo_operacion: document.getElementById('sd_operacion').value,
+    responsable: document.getElementById('sd_responsable').value.trim(),
+    items: _sdItems,
+  };
+  if (!body.motivo) { toast('El motivo es obligatorio', 'rojo'); return; }
+  if (!_sdItems.length) { toast('Agrega al menos un producto', 'rojo'); return; }
+  _guardandoDoc = true;
+  const btn = document.getElementById('sd_btn');
+  const txt = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Guardando...';
   try {
-    const d = datosProducto(req.body || {});
-    if (!d.nombre) return res.status(400).json({ ok: false, error: 'El nombre es obligatorio' });
-    const inicial = parseInt((req.body || {}).stock_inicial) || 0;
-    const eid = req.user.empresa_id;
-    await conn.beginTransaction();
-    const [r] = await conn.query('INSERT INTO productos SET ?', [{ ...d, empresa_id: eid, stock: 0 }]);
-    if (inicial > 0) {
-      const alm = await almacenPrincipal(conn, eid);
-      await moverStock(conn, { empresaId: eid, productoId: r.insertId, almacenId: alm, delta: inicial, tipo: 'carga', motivo: 'Stock inicial', usuarioId: req.user.id });
-    }
-    await conn.commit();
-    res.json({ ok: true, id: r.insertId });
-  } catch (e) {
-    await conn.rollback();
-    res.status(500).json({ ok: false, error: e.message });
-  } finally { conn.release(); }
+    const d = await api('/api/stock-documentos', { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
+    if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+    toast(_sdTipo === 'carga' ? 'Stock cargado' : 'Stock descargado', 'verde');
+    cerrarModal('mStockDoc');
+    cargarProductos();
+    cargarStockDocs(_sdTipo);
+  } finally {
+    _guardandoDoc = false;
+    btn.disabled = false; btn.textContent = txt;
+  }
+}
+async function verStockDoc(id) {
+  document.getElementById('sdd_contenido').innerHTML = 'Cargando...';
+  abrirModal('mStockDetalle');
+  const d = await api(`/api/stock-documentos/${id}`, { headers: authHeaders() });
+  if (!d.ok) { document.getElementById('sdd_contenido').innerHTML = d.error || 'Error'; return; }
+  const x = d.documento;
+  document.getElementById('sdd_contenido').innerHTML = `
+    <h2>${x.tipo === 'carga' ? 'Carga' : 'Descarga'} #${x.numero}</h2>
+    <p class="modal-sub">${fmtFecha(x.created_at)} — ${x.almacen_nombre || ''} — ${x.motivo || ''}${x.responsable ? ' — Resp: ' + x.responsable : ''}</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Cód. barras</th><th>Concepto</th><th>P. compra</th><th>P. venta</th><th>Cantidad</th></tr></thead>
+      <tbody>${x.items.map(i => `<tr><td>${i.codigo_barras || '—'}</td><td>${i.nombre}</td><td>${fmtMoney(i.precio_compra)}</td><td>${fmtMoney(i.precio_venta)}</td><td>${i.cantidad}</td></tr>`).join('')}</tbody>
+    </table></div>
+    ${x.tipo === 'carga' ? `<div style="text-align:right;font-weight:800;margin-top:10px;">Total: ${fmtMoney(x.total)}</div>` : ''}`;
+}
+
+// ── Stock por almacén ──
+let _stockFilas = [];
+async function cargarStockAlmacen() {
+  await Promise.all([cargarAlmacenes(), cargarProductos()]);
+  const sel = document.getElementById('sa_almacen');
+  const actual = sel.value;
+  sel.innerHTML = '<option value="">Almacén...</option>' + _almacenes.map(a => `<option value="${a.id}">${a.nombre}</option>`).join('');
+  sel.value = actual;
+  const d = await api('/api/stock-almacen', { headers: authHeaders() });
+  _stockFilas = d.ok ? d.filas : [];
+  renderStockAlmacen();
+}
+function renderStockAlmacen() {
+  const q = document.getElementById('sa_buscar').value.trim().toLowerCase();
+  const al = document.getElementById('sa_almacen').value;
+  const lista = _stockFilas.filter(f => (!q || String(f.nombre).toLowerCase().includes(q)) && (!al || String(f.almacen_id) === al));
+  document.getElementById('tbStockAlmacen').innerHTML = lista.length
+    ? lista.map(f => {
+        const prod = _productos.find(p => String(p.id) === String(f.producto_id));
+        const foto = f.foto_url || prod?.foto_url;
+        return `<tr>
+          <td>
+            <div class="prod-cell">
+              ${foto
+                ? `<a href="${foto}" target="_blank" title="Ver foto completa"><img src="${thumb(foto, 104)}" class="prod-foto" loading="lazy"></a>`
+                : `<span class="prod-foto-ph">📦</span>`}
+              <span class="prod-nombre">${f.nombre}</span>
+            </div>
+          </td>
+          <td>${fmtMoney(f.precio_compra)}</td>
+          <td>${fmtMoney(f.precio_venta)}</td>
+          <td>${f.almacen}</td>
+          <td>${f.stock}</td>
+        </tr>`;
+      }).join('')
+    : '<tr class="empty-row"><td colspan="5" style="text-align:center;">Sin datos</td></tr>';
+}
+async function crearAlmacen() {
+  const nombre = prompt('Nombre del nuevo almacén:');
+  if (!nombre || !nombre.trim()) return;
+  const d = await api('/api/almacenes', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ nombre: nombre.trim() }) });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Almacén creado', 'verde');
+  cargarStockAlmacen();
+}
+document.addEventListener('click', (e) => {
+  const box = document.getElementById('sd_resultados');
+  if (box && !e.target.closest('#sd_buscar') && !box.contains(e.target)) box.style.display = 'none';
 });
-
-app.post('/api/productos/:id/foto', verificarToken, requireRoles('propietario', 'recepcion'), upload.single('foto'), ah(async (req, res) => {
-  if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió ninguna imagen' });
-  const result = await subirACloudinary(req.file.buffer, 'vetcore/productos');
-  await pool.query('UPDATE productos SET foto_url=? WHERE id=? AND empresa_id=?', [result.secure_url, req.params.id, req.user.empresa_id]);
-  res.json({ ok: true, foto_url: result.secure_url });
-}));
-
-// El stock NO se edita aquí: se cambia con cargar/descargar stock
-app.put('/api/productos/:id', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
-  const d = datosProducto(req.body || {});
-  if (!d.nombre) return res.status(400).json({ ok: false, error: 'El nombre es obligatorio' });
-  await pool.query('UPDATE productos SET ? WHERE id=? AND empresa_id=?', [d, req.params.id, req.user.empresa_id]);
-  res.json({ ok: true });
-}));
-
-app.delete('/api/productos/:id', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
-  await pool.query('DELETE FROM stock_almacen WHERE producto_id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  await pool.query('DELETE FROM productos WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true });
-}));
-
-app.get('/api/productos/:id/kardex', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT m.*, a.nombre AS almacen_nombre, u.nombre AS usuario_nombre
-     FROM movimientos_stock m
-     LEFT JOIN almacenes a ON a.id = m.almacen_id
-     LEFT JOIN usuarios u ON u.id = m.usuario_id
-     WHERE m.producto_id=? AND m.empresa_id=? ORDER BY m.id DESC LIMIT 200`,
-    [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true, movimientos: rows });
-}));
-
-// ── ALMACENES ────────────────────────────────────────────────
-app.get('/api/almacenes', verificarToken, requireEmpresa, ah(async (req, res) => {
-  await almacenPrincipal(pool, req.user.empresa_id);
-  const [rows] = await pool.query('SELECT id, nombre, es_principal FROM almacenes WHERE empresa_id=? ORDER BY es_principal DESC, nombre', [req.user.empresa_id]);
-  res.json({ ok: true, almacenes: rows });
-}));
-
-app.post('/api/almacenes', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
-  const nombre = String((req.body || {}).nombre || '').trim();
-  if (!nombre) return res.status(400).json({ ok: false, error: 'El nombre es obligatorio' });
-  const [r] = await pool.query('INSERT INTO almacenes (empresa_id, nombre) VALUES (?,?)', [req.user.empresa_id, nombre]);
-  res.json({ ok: true, id: r.insertId });
-}));
-
-// Stock por almacén: cada producto × cada almacén (con 0 si no hay)
-app.get('/api/stock-almacen', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
-  const eid = req.user.empresa_id;
-  await almacenPrincipal(pool, eid);
-  const [rows] = await pool.query(
-    `SELECT p.id AS producto_id, p.nombre, p.precio_compra, p.precio_venta,
-            a.id AS almacen_id, a.nombre AS almacen, COALESCE(sa.stock,0) AS stock
-     FROM productos p
-     JOIN almacenes a ON a.empresa_id = p.empresa_id
-     LEFT JOIN stock_almacen sa ON sa.producto_id = p.id AND sa.almacen_id = a.id
-     WHERE p.empresa_id=? ORDER BY p.nombre, a.es_principal DESC, a.id`, [eid]);
-  res.json({ ok: true, filas: rows });
-}));
-
-// ── CARGAS / DESCARGAS DE STOCK ──────────────────────────────
-app.get('/api/stock-documentos', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
-  const tipo = req.query.tipo === 'descarga' ? 'descarga' : 'carga';
-  const [rows] = await pool.query(
-    `SELECT d.id, d.numero, d.tipo, d.motivo, d.tipo_operacion, d.responsable, d.total, d.created_at,
-            a.nombre AS almacen_nombre, u.nombre AS registrado_por
-     FROM stock_documentos d
-     LEFT JOIN almacenes a ON a.id = d.almacen_id
-     LEFT JOIN usuarios u ON u.id = d.usuario_id
-     WHERE d.empresa_id=? AND d.tipo=? ORDER BY d.id DESC LIMIT 200`, [req.user.empresa_id, tipo]);
-  res.json({ ok: true, documentos: rows });
-}));
-
-app.get('/api/stock-documentos/:id', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT d.*, a.nombre AS almacen_nombre, u.nombre AS registrado_por
-     FROM stock_documentos d
-     LEFT JOIN almacenes a ON a.id = d.almacen_id
-     LEFT JOIN usuarios u ON u.id = d.usuario_id
-     WHERE d.id=? AND d.empresa_id=?`, [req.params.id, req.user.empresa_id]);
-  if (!rows[0]) return res.status(404).json({ ok: false, error: 'Documento no encontrado' });
+// ══════════════════════════════════════════════════════════════
+// VENTAS
+// ══════════════════════════════════════════════════════════════
+let _ventas = [];
+let _itemsVenta = [];
+async function cargarVentas() {
+  const d = await api('/api/ventas', { headers: authHeaders() });
+  _ventas = d.ok ? d.ventas : [];
+  renderVentas();
+}
+function renderVentas() {
+  document.getElementById('tbVentas').innerHTML = _ventas.length
+    ? _ventas.map(v => `<tr>
+        <td>${fmtFecha(v.created_at)}</td>
+        <td>${v.cliente_nombre || '—'}</td>
+        <td>${v.paciente_nombre || '—'}</td>
+        <td><strong>${fmtMoney(v.total)}</strong></td>
+        <td><span class="badge ${v.estado_pago === 'pagado' ? 'b-primary' : 'b-accent'}">${v.estado_pago}</span></td>
+        <td>
+          <div style="display:flex;gap:6px;">
+            <button class="btn btn-ghost btn-sm" onclick="verComprobante(${v.id})">Ver</button>
+            ${v.estado_pago !== 'pagado' ? `<button class="btn btn-primary btn-sm" onclick="registrarPago(${v.id})">Registrar pago</button>` : ''}
+            <button class="btn btn-danger btn-sm" onclick="eliminarVenta(${v.id})">Eliminar</button>
+          </div>
+        </td>
+      </tr>`).join('')
+    : '<tr class="empty-row"><td colspan="6">Aún no tienes ventas registradas</td></tr>';
+}
+async function abrirCrearVenta() {
+  await Promise.all([asegurarClientesCargados(), cargarProductosParaVenta()]);
+  poblarSelectClientes('ve_cliente_id');
+  document.getElementById('ve_paciente_id').innerHTML = '<option value="">—</option>';
+  document.getElementById('ve_descuento').value = 0;
+  document.getElementById('ve_estado_pago').value = 'pagado';
+  document.getElementById('ve_item_nombre').value = '';
+  document.getElementById('ve_item_precio').value = '';
+  _itemsVenta = [];
+  renderItemsVenta();
+  abrirModal('mVenta');
+}
+async function cargarProductosParaVenta() {
+  const d = await api('/api/productos', { headers: authHeaders() });
+  _productos = d.ok ? d.productos : [];
+  const sel = document.getElementById('ve_producto_select');
+  sel.innerHTML = _productos.map(p => `<option value="${p.id}">${p.nombre} — ${fmtMoney(p.precio_venta)} (stock: ${p.stock})</option>`).join('')
+    || '<option value="">Sin productos en inventario</option>';
+}
+function agregarItemDesdeInventario() {
+  const sel = document.getElementById('ve_producto_select');
+  const id = sel.value;
+  const p = _productos.find(x => String(x.id) === String(id));
+  if (!p) { toast('Agrega productos al inventario primero'); return; }
+  _itemsVenta.push({ producto_id: p.id, nombre: p.nombre, precio: Number(p.precio_venta), cantidad: 1 });
+  renderItemsVenta();
+}
+function agregarItemLibre() {
+  const nombre = document.getElementById('ve_item_nombre').value.trim();
+  const precio = Number(document.getElementById('ve_item_precio').value || 0);
+  if (!nombre || !precio) { toast('Escribe un nombre y un precio válido', 'rojo'); return; }
+  _itemsVenta.push({ nombre, precio, cantidad: 1 });
+  document.getElementById('ve_item_nombre').value = '';
+  document.getElementById('ve_item_precio').value = '';
+  renderItemsVenta();
+}
+function cambiarCantidadItem(i, delta) {
+  _itemsVenta[i].cantidad = Math.max(1, (_itemsVenta[i].cantidad || 1) + delta);
+  renderItemsVenta();
+}
+function quitarItemVenta(i) {
+  _itemsVenta.splice(i, 1);
+  renderItemsVenta();
+}
+function renderItemsVenta() {
+  const list = document.getElementById('ve_items_list');
+  list.innerHTML = _itemsVenta.length
+    ? _itemsVenta.map((it, i) => `
+      <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border);font-size:13.5px;">
+        <div style="flex:1;">${it.nombre}</div>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <button type="button" class="btn btn-ghost btn-sm" onclick="cambiarCantidadItem(${i},-1)">−</button>
+          <span>${it.cantidad}</span>
+          <button type="button" class="btn btn-ghost btn-sm" onclick="cambiarCantidadItem(${i},1)">+</button>
+        </div>
+        <div style="width:70px;text-align:right;font-weight:700;">${fmtMoney(it.precio * it.cantidad)}</div>
+        <button type="button" class="btn btn-danger btn-sm" onclick="quitarItemVenta(${i})">✕</button>
+      </div>`).join('')
+    : '<p style="color:var(--ink-soft);font-size:13px;">Aún no has agregado productos o servicios</p>';
+  const subtotal = _itemsVenta.reduce((a, it) => a + it.precio * it.cantidad, 0);
+  const descuento = Number(document.getElementById('ve_descuento').value || 0);
+  const total = Math.max(subtotal - descuento, 0);
+  document.getElementById('ve_total_txt').textContent = fmtMoney(total);
+}
+async function guardarVenta() {
+  if (!_itemsVenta.length) { toast('Agrega al menos un producto o servicio', 'rojo'); return; }
+  const body = {
+    cliente_id: document.getElementById('ve_cliente_id').value || null,
+    paciente_id: document.getElementById('ve_paciente_id').value || null,
+    items: _itemsVenta,
+    descuento: document.getElementById('ve_descuento').value || 0,
+    metodo_pago: document.getElementById('ve_metodo').value,
+    estado_pago: document.getElementById('ve_estado_pago').value,
+  };
+  const d = await api('/api/ventas', { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast(`Venta registrada por ${fmtMoney(d.total)}`, 'verde');
+  cerrarModal('mVenta');
+  cargarVentas();
+}
+async function eliminarVenta(id) {
+  if (!confirm('¿Eliminar esta venta?')) return;
+  const d = await api(`/api/ventas/${id}`, { method: 'DELETE', headers: authHeaders() });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Venta eliminada', 'verde');
+  cargarVentas();
+}
+async function registrarPago(id) {
+  const d = await api(`/api/ventas/${id}/pago`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({}) });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Pago registrado', 'verde');
+  cargarVentas();
+}
+function verComprobante(id) {
+  const v = _ventas.find(x => x.id === id); if (!v) return;
   let items = [];
-  try { items = typeof rows[0].items_json === 'string' ? JSON.parse(rows[0].items_json) : (rows[0].items_json || []); } catch (e) {}
-  res.json({ ok: true, documento: { ...rows[0], items_json: undefined, items } });
-}));
+  try { items = typeof v.items_json === 'string' ? JSON.parse(v.items_json) : (v.items_json || []); } catch (e) { items = []; }
+  document.getElementById('cp_contenido').innerHTML = `
+    <p class="modal-sub">${fmtFecha(v.created_at)} — ${v.cliente_nombre || 'Sin cliente'}${v.paciente_nombre ? ' · ' + v.paciente_nombre : ''}</p>
+    <div style="margin:14px 0;">
+      ${items.map(it => `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);font-size:13.5px;">
+        <span>${it.nombre} ${it.cantidad > 1 ? '× ' + it.cantidad : ''}</span><span>${fmtMoney(it.precio * (it.cantidad || 1))}</span>
+      </div>`).join('')}
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:13.5px;"><span>Subtotal</span><span>${fmtMoney(v.subtotal)}</span></div>
+    <div style="display:flex;justify-content:space-between;font-size:13.5px;"><span>Descuento</span><span>-${fmtMoney(v.descuento)}</span></div>
+    <div style="display:flex;justify-content:space-between;font-weight:800;font-size:16px;margin-top:6px;"><span>Total</span><span>${fmtMoney(v.total)}</span></div>
+    <p style="margin-top:10px;color:var(--ink-soft);font-size:12.5px;">Método: ${v.metodo_pago} — Estado: ${v.estado_pago}</p>
+  `;
+  abrirModal('mComprobante');
+}
 
-app.post('/api/stock-documentos', verificarToken, requireRoles('propietario', 'recepcion'), async (req, res) => {
-  const conn = await pool.getConnection();
-  try {
-    const eid = req.user.empresa_id;
-    const { tipo, almacen_id, motivo, tipo_operacion, responsable, items } = req.body || {};
-    if (!['carga', 'descarga'].includes(tipo)) return res.status(400).json({ ok: false, error: 'Tipo inválido' });
-    if (!String(motivo || '').trim()) return res.status(400).json({ ok: false, error: 'El motivo es obligatorio' });
-    if (!Array.isArray(items) || !items.length) return res.status(400).json({ ok: false, error: 'Agrega al menos un producto' });
-    const [alm] = await conn.query('SELECT id FROM almacenes WHERE id=? AND empresa_id=?', [almacen_id, eid]);
-    if (!alm.length) return res.status(400).json({ ok: false, error: 'Almacén no válido' });
+// ══════════════════════════════════════════════════════════════
+// DASHBOARD "INICIO" — resumen rediseñado
+// ══════════════════════════════════════════════════════════════
+async function cargarResumen() {
+  const d = await api('/api/resumen', { headers: authHeaders() });
+  if (!d.ok) return;
 
-    await conn.beginTransaction();
-    const [[{ n }]] = await conn.query('SELECT COALESCE(MAX(numero),0)+1 AS n FROM stock_documentos WHERE empresa_id=? AND tipo=?', [eid, tipo]);
-    const [ins] = await conn.query(
-      `INSERT INTO stock_documentos (empresa_id, numero, tipo, almacen_id, motivo, tipo_operacion, responsable, usuario_id, items_json, total)
-       VALUES (?,?,?,?,?,?,?,?,'[]',0)`,
-      [eid, n, tipo, almacen_id, String(motivo).trim(), tipo_operacion || '', responsable || '', req.user.id]);
-    const docId = ins.insertId;
+  const hora = new Date().getHours();
+  const saludo = hora < 12 ? 'Buenos días' : hora < 19 ? 'Buenas tardes' : 'Buenas noches';
+  document.getElementById('greetingTitle').textContent = `${saludo}, ${(user.nombre || user.nombre_clinica || '').split(' ')[0] || ''}`;
 
-    const detalle = []; let total = 0;
-    for (const it of items) {
-      const cant = parseInt(it.cantidad);
-      if (!cant || cant < 1) throw new Error('Cantidad inválida');
-      const [[p]] = await conn.query('SELECT * FROM productos WHERE id=? AND empresa_id=?', [it.producto_id, eid]);
-      if (!p) throw new Error('Producto no encontrado');
-      let pc = Number(p.precio_compra), pv = Number(p.precio_venta);
-      if (tipo === 'carga') {
-        if (it.precio_compra !== undefined && it.precio_compra !== '') pc = Number(it.precio_compra) || 0;
-        if (it.precio_venta !== undefined && it.precio_venta !== '') pv = Number(it.precio_venta) || 0;
-        await conn.query('UPDATE productos SET precio_compra=?, precio_venta=? WHERE id=? AND empresa_id=?', [pc, pv, p.id, eid]);
-      }
-      await moverStock(conn, {
-        empresaId: eid, productoId: p.id, almacenId: almacen_id, delta: tipo === 'carga' ? cant : -cant,
-        tipo, motivo: String(motivo).trim(), usuarioId: req.user.id, docId
-      });
-      detalle.push({ producto_id: p.id, codigo_barras: p.codigo_barras, nombre: p.nombre, precio_compra: pc, precio_venta: pv, cantidad: cant });
-      total += pc * cant;
+  document.getElementById('st-citasHoy').textContent = d.citasHoy;
+  document.getElementById('st-enEspera').textContent = d.enEspera;
+  document.getElementById('st-ventasHoy').textContent = fmtMoney(d.ventasHoy);
+  document.getElementById('st-alertas').textContent = d.alertas;
+
+  const citasBox = document.getElementById('inicioProximasCitas');
+  citasBox.innerHTML = (d.proximasCitas || []).length
+    ? d.proximasCitas.map(c => `
+      <div class="inicio-list-item">
+        <span class="inicio-hora">${c.hora ? c.hora.slice(0,5) : '—'}</span>
+        <span style="flex:1;">${c.paciente_nombre || '—'} — ${c.motivo || 'Consulta'}</span>
+        <span class="badge ${estadoBadge[c.estado] || 'b-grey'}">${c.estado}</span>
+      </div>`).join('')
+    : '<p style="color:var(--ink-soft);font-size:13px;">No hay más citas para hoy.</p>';
+
+  let alertHtml = '';
+  if (d.stockBajo > 0) alertHtml += `<div class="alert-item">📦 ${d.stockBajo} producto(s) con stock bajo</div>`;
+  if (d.enEspera > 0) alertHtml += `<div class="alert-item">⏳ ${d.enEspera} paciente(s) en espera</div>`;
+  document.getElementById('inicioAlertas').innerHTML = alertHtml || '<p style="color:var(--ink-soft);font-size:13px;">Sin alertas por ahora.</p>';
+}
+
+// ══════════════════════════════════════════════════════════════
+// BÚSQUEDA GLOBAL
+// ══════════════════════════════════════════════════════════════
+let _searchTimer = null;
+function buscarGlobal(term) {
+  clearTimeout(_searchTimer);
+  const box = document.getElementById('searchResults');
+  if (!term.trim()) { box.classList.remove('open'); return; }
+  _searchTimer = setTimeout(async () => {
+    const d = await api('/api/buscar?q=' + encodeURIComponent(term), { headers: authHeaders() });
+    if (!d.ok) return;
+    let html = '';
+    if (d.pacientes.length) {
+      html += '<div class="search-results-group">Pacientes</div>';
+      html += d.pacientes.map(p => `<div class="search-result-item" onclick="cerrarBusqueda();abrirFichaPaciente(${p.id})"><span>🐾 ${p.nombre}</span><span style="color:var(--ink-soft);">${p.cliente_nombre}</span></div>`).join('');
     }
-    await conn.query('UPDATE stock_documentos SET items_json=?, total=? WHERE id=?', [JSON.stringify(detalle), total, docId]);
-    await conn.commit();
-    res.json({ ok: true, id: docId, numero: n });
-  } catch (e) {
-    await conn.rollback();
-    res.status(400).json({ ok: false, error: e.message });
-  } finally { conn.release(); }
+    if (d.clientes.length) {
+      html += '<div class="search-results-group">Clientes</div>';
+      html += d.clientes.map(c => `<div class="search-result-item" onclick="cerrarBusqueda();ir('clientes')"><span>👤 ${c.nombre}</span><span style="color:var(--ink-soft);">${c.telefono || ''}</span></div>`).join('');
+    }
+    if (!html) html = '<div class="search-empty">Sin resultados</div>';
+    box.innerHTML = html;
+    box.classList.add('open');
+  }, 300);
+}
+function cerrarBusqueda() {
+  document.getElementById('searchResults').classList.remove('open');
+  document.getElementById('globalSearch').value = '';
+}
+document.addEventListener('click', (e) => {
+  const wrap = document.querySelector('.search-bar-wrap');
+  if (wrap && !wrap.contains(e.target)) document.getElementById('searchResults')?.classList.remove('open');
 });
 
 // ══════════════════════════════════════════════════════════════
-// VENTAS / COBROS — los 3 roles crean y consultan; borrar: propietario y recepción
+// FICHA DEL PACIENTE — centro conector
 // ══════════════════════════════════════════════════════════════
-app.get('/api/ventas', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT v.*, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre, vet.nombre AS veterinario_nombre
-     FROM ventas v
-     LEFT JOIN clientes c ON c.id = v.cliente_id
-     LEFT JOIN pacientes pa ON pa.id = v.paciente_id
-     LEFT JOIN usuarios vet ON vet.id = v.veterinario_id
-     WHERE v.empresa_id=? ORDER BY v.id DESC`, [req.user.empresa_id]
-  );
-  res.json({ ok: true, ventas: rows });
-}));
-
-
-app.post('/api/ventas', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), async (req, res) => {
-  const conn = await pool.getConnection();
-  try {
-    const { cliente_id, paciente_id, historia_id, items, descuento, metodo_pago, estado_pago,
-            referencia, tipo_tarjeta, recibido, cambio } = req.body || {};
-    if (!Array.isArray(items) || !items.length) return res.status(400).json({ ok: false, error: 'Agrega al menos un producto o servicio' });
-    const eid = req.user.empresa_id;
-
-    await conn.beginTransaction();
-    if (historia_id) {
-      const [dup] = await conn.query('SELECT id FROM ventas WHERE historia_id=? AND empresa_id=?', [historia_id, eid]);
-      if (dup.length) throw new Error('Esta consulta ya tiene una venta registrada');
-    }
-
-    let subtotal = 0; const lineas = [];
-    for (const item of items) {
-      const cant = Math.max(1, parseInt(item.cantidad) || 1);
-      let nombre = item.nombre, precio = Number(item.precio) || 0;
-      if (item.producto_id) {
-        const [[p]] = await conn.query('SELECT nombre, precio_venta FROM productos WHERE id=? AND empresa_id=?', [item.producto_id, eid]);
-        if (!p) throw new Error('Producto no encontrado');
-        nombre = p.nombre; precio = Number(p.precio_venta);
-        await descontarVenta(conn, eid, item.producto_id, cant, req.user.id);
-      }
-      subtotal += precio * cant;
-      lineas.push({ producto_id: item.producto_id || null, nombre, precio, cantidad: cant });
-    }
-    const total = Math.max(subtotal - Number(descuento || 0), 0);
-    const estado = estado_pago === 'pendiente' ? 'pendiente' : 'pagado';
-    const [[{ n }]] = await conn.query('SELECT COALESCE(MAX(numero),0)+1 AS n FROM ventas WHERE empresa_id=?', [eid]);
-
-    const [result] = await conn.query(
-      `INSERT INTO ventas (empresa_id, numero, cliente_id, paciente_id, historia_id, veterinario_id, items_json, subtotal, descuento, total,
-                           metodo_pago, estado_pago, referencia, tipo_tarjeta, recibido, cambio)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [eid, n, cliente_id || null, paciente_id || null, historia_id || null,
-       req.user.rol === 'veterinario' ? req.user.id : null, JSON.stringify(lineas),
-       subtotal, descuento || 0, total, metodo_pago || 'efectivo', estado,
-       referencia || '', tipo_tarjeta || '', recibido ?? null, cambio ?? null]
-    );
-    await conn.commit();
-    res.json({ ok: true, id: result.insertId, numero: n, total });
-  } catch (e) {
-    await conn.rollback();
-    res.status(400).json({ ok: false, error: e.message });
-  } finally {
-    conn.release();
-  }
-});
-
-app.post('/api/ventas/:id/comprobante', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), upload.single('comprobante'), ah(async (req, res) => {
-  if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió la imagen' });
-  const [r] = await pool.query('SELECT id FROM ventas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  if (!r.length) return res.status(404).json({ ok: false, error: 'Venta no encontrada' });
-  const up = await subirACloudinary(req.file.buffer, 'vetcore/comprobantes');
-  await pool.query('UPDATE ventas SET comprobante_url=? WHERE id=?', [up.secure_url, req.params.id]);
-  res.json({ ok: true, comprobante_url: up.secure_url });
-}));
-
-// Precios de servicios (Configuración): todos leen, solo propietario edita
-app.get('/api/servicios', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const [rows] = await pool.query('SELECT nombre, precio FROM servicios WHERE empresa_id=? ORDER BY nombre', [req.user.empresa_id]);
-  res.json({ ok: true, servicios: rows });
-}));
-app.put('/api/servicios', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
-  const { nombre, precio } = req.body || {};
-  if (!nombre) return res.status(400).json({ ok: false, error: 'Nombre obligatorio' });
-  await pool.query(
-    'INSERT INTO servicios (empresa_id, nombre, precio) VALUES (?,?,?) ON DUPLICATE KEY UPDATE precio=VALUES(precio)',
-    [req.user.empresa_id, nombre, Number(precio) || 0]);
-  res.json({ ok: true });
-}));
-
-// "Registrar pago" de una venta que quedó pendiente
-app.put('/api/ventas/:id/pago', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
-  const metodo = (req.body || {}).metodo_pago;
-  await pool.query(
-    `UPDATE ventas SET estado_pago='pagado', metodo_pago=COALESCE(?, metodo_pago) WHERE id=? AND empresa_id=?`,
-    [metodo || null, req.params.id, req.user.empresa_id]
-  );
-  res.json({ ok: true });
-}));
-
-app.delete('/api/ventas/:id', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
-  await pool.query('DELETE FROM ventas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true });
-}));
-
-// ══════════════════════════════════════════════════════════════
-// FINANZAS / CAJA — propietario ve el rango completo; veterinario y recepción, solo hoy y totales
-// ══════════════════════════════════════════════════════════════
-app.get('/api/caja', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const { desde, hasta, limitado } = await resolverRango(req);
-  const eid = req.user.empresa_id;
-  const base = `FROM ventas WHERE empresa_id=? AND DATE(created_at) BETWEEN ? AND ?`;
-  const [porMetodo] = await pool.query(
-    `SELECT metodo_pago AS metodo, COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total ${base} AND estado_pago='pagado' GROUP BY metodo_pago`,
-    [eid, desde, hasta]
-  );
-  const [[pendiente]] = await pool.query(
-    `SELECT COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total ${base} AND estado_pago<>'pagado'`,
-    [eid, desde, hasta]
-  );
-  let porDia = [];
-  if (!limitado) {
-    [porDia] = await pool.query(
-      `SELECT DATE_FORMAT(created_at,'%Y-%m-%d') AS dia, COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total
-       ${base} AND estado_pago='pagado' GROUP BY DATE_FORMAT(created_at,'%Y-%m-%d') ORDER BY dia`,
-      [eid, desde, hasta]
-    );
-  }
-  const total = porMetodo.reduce((a, m) => a + Number(m.total || 0), 0);
-  const cantidad = porMetodo.reduce((a, m) => a + Number(m.cantidad || 0), 0);
-  res.json({ ok: true, desde, hasta, limitado, total, cantidad, porMetodo, pendiente, porDia });
-}));
-
-// ══════════════════════════════════════════════════════════════
-// REPORTES — propietario ve el rango completo con extras; veterinario y recepción, solo hoy
-// (el veterinario solo cuenta lo suyo)
-// ══════════════════════════════════════════════════════════════
-app.get('/api/reportes', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const { desde, hasta, limitado } = await resolverRango(req);
-  const eid = req.user.empresa_id;
-  const esVet = req.user.rol === 'veterinario';
-
-  const pCitas = [eid, desde, hasta]; let fCitas = '';
-  const pAt = [eid, desde, hasta]; let fAt = '';
-  if (esVet) { fCitas = ' AND veterinario_id=?'; pCitas.push(req.user.id); fAt = ' AND veterinario_id=?'; pAt.push(req.user.id); }
-
-  const [citasPorEstado] = await pool.query(
-    `SELECT estado, COUNT(*) AS total FROM citas WHERE empresa_id=? AND fecha BETWEEN ? AND ?${fCitas} GROUP BY estado`, pCitas
-  );
-  const [atencionesPorEstado] = await pool.query(
-    `SELECT estado, COUNT(*) AS total FROM atenciones WHERE empresa_id=? AND DATE(created_at) BETWEEN ? AND ?${fAt} GROUP BY estado`, pAt
-  );
-
-  const out = { ok: true, desde, hasta, limitado, citasPorEstado, atencionesPorEstado };
-
-  if (!limitado) {
-    const [[{ consultas }]] = await pool.query(
-      `SELECT COUNT(*) AS consultas FROM historias WHERE empresa_id=? AND fecha BETWEEN ? AND ?`, [eid, desde, hasta]
-    );
-    const [porVeterinario] = await pool.query(
-      `SELECT v.nombre AS veterinario, COUNT(*) AS total
-       FROM atenciones a JOIN usuarios v ON v.id=a.veterinario_id
-       WHERE a.empresa_id=? AND DATE(a.created_at) BETWEEN ? AND ? GROUP BY a.veterinario_id, v.nombre ORDER BY total DESC`,
-      [eid, desde, hasta]
-    );
-    const [ventas] = await pool.query(
-      `SELECT items_json FROM ventas WHERE empresa_id=? AND DATE(created_at) BETWEEN ? AND ? AND estado_pago='pagado' LIMIT 5000`,
-      [eid, desde, hasta]
-    );
-    const mapa = {};
-    for (const v of ventas) {
-      let items = [];
-      try { items = typeof v.items_json === 'string' ? JSON.parse(v.items_json) : (v.items_json || []); } catch (e) { items = []; }
-      for (const it of items) {
-        const k = it.nombre || '—';
-        mapa[k] = mapa[k] || { nombre: k, cantidad: 0, total: 0 };
-        mapa[k].cantidad += Number(it.cantidad || 1);
-        mapa[k].total += Number(it.precio || 0) * Number(it.cantidad || 1);
-      }
-    }
-    out.consultas = Number(consultas || 0);
-    out.porVeterinario = porVeterinario;
-    out.topProductos = Object.values(mapa).sort((a, b) => b.total - a.total).slice(0, 8);
-  }
-  res.json(out);
-}));
-
-// ══════════════════════════════════════════════════════════════
-// DASHBOARD RESUMEN — solo propietario (el veterinario y recepción arman su inicio con citas, atenciones y caja)
-// ══════════════════════════════════════════════════════════════
-app.get('/api/resumen', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
-  const eid = req.user.empresa_id;
-  const [[{ totalClientes }]] = await pool.query('SELECT COUNT(*) AS totalClientes FROM clientes WHERE empresa_id=?', [eid]);
-  const [[{ totalPacientes }]] = await pool.query('SELECT COUNT(*) AS totalPacientes FROM pacientes WHERE empresa_id=?', [eid]);
-  const [[{ citasHoy }]] = await pool.query('SELECT COUNT(*) AS citasHoy FROM citas WHERE empresa_id=? AND fecha=CURDATE()', [eid]);
-  const [[{ enEspera }]] = await pool.query(`SELECT COUNT(*) AS enEspera FROM atenciones WHERE empresa_id=? AND estado IN ('llegada','triaje','espera')`, [eid]);
-  const [[{ ventasMes }]] = await pool.query(
-    `SELECT COALESCE(SUM(total),0) AS ventasMes FROM ventas WHERE empresa_id=? AND MONTH(created_at)=MONTH(CURDATE()) AND YEAR(created_at)=YEAR(CURDATE())`, [eid]
-  );
-  const [[{ ventasHoy }]] = await pool.query(`SELECT COALESCE(SUM(total),0) AS ventasHoy FROM ventas WHERE empresa_id=? AND DATE(created_at)=CURDATE()`, [eid]);
-  const [[{ stockBajo }]] = await pool.query('SELECT COUNT(*) AS stockBajo FROM productos WHERE empresa_id=? AND stock <= stock_minimo', [eid]);
-  const [proximasCitas] = await pool.query(
-    `SELECT ci.*, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre
-     FROM citas ci LEFT JOIN clientes c ON c.id=ci.cliente_id LEFT JOIN pacientes pa ON pa.id=ci.paciente_id
-     WHERE ci.empresa_id=? AND ci.fecha=CURDATE() AND ci.estado NOT IN ('cancelada','atendida')
-     ORDER BY ci.hora ASC LIMIT 6`, [eid]
-  );
-  const alertas = Number(stockBajo);
-  res.json({ ok: true, totalClientes, totalPacientes, citasHoy, enEspera, ventasMes, ventasHoy, stockBajo, alertas, proximasCitas });
-}));
-
-
-
-// ── (1) Subida de PDFs (laboratorio) ─────────────────────────
-const uploadPdf = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter: (req, file, cb) =>
-    file.mimetype === 'application/pdf' ? cb(null, true) : cb(new Error('Solo se permiten archivos PDF')),
-});
- 
-function subirPdfACloudinary(buffer, folder, nombre) {
-  const limpio = String(nombre || 'archivo.pdf').replace(/[^\w.\-]/g, '_');
-  return new Promise((resolve, reject) => {
-    const stream = cloudinary.uploader.upload_stream(
-      { folder, resource_type: 'raw', public_id: `${Date.now()}-${limpio}` },
-      (err, result) => err ? reject(err) : resolve(result)
-    );
-    stream.end(buffer);
+let _fpPacienteActivo = null;
+async function abrirFichaPaciente(id) {
+  await asegurarPacientesCargados();
+  _fpPacienteActivo = _pacientes.find(p => p.id === id);
+  if (!_fpPacienteActivo) return;
+  document.getElementById('fp_nombre').textContent = _fpPacienteActivo.nombre;
+  document.getElementById('fp_sub').textContent = `${_fpPacienteActivo.especie || ''} ${_fpPacienteActivo.raza ? '· ' + _fpPacienteActivo.raza : ''} — Tutor: ${_fpPacienteActivo.cliente_nombre}`;
+  document.getElementById('fp_avatar').innerHTML = _fpPacienteActivo.foto_url
+    ? `<img src="${_fpPacienteActivo.foto_url}" style="width:100%;height:100%;object-fit:cover;border-radius:14px;">`
+    : (_fpPacienteActivo.especie?.toLowerCase().includes('gat') ? '🐱' : '🐶');
+  cambiarTabFicha('resumen');
+  abrirModal('mFichaPaciente');
+}
+function cambiarTabFicha(tab) {
+  document.getElementById('fp_tab_resumen').classList.toggle('active', tab === 'resumen');
+  document.getElementById('fp_tab_historia').classList.toggle('active', tab === 'historia');
+  if (tab === 'resumen') renderFichaResumen(); else renderFichaHistoria();
+}
+function renderFichaResumen() {
+  const p = _fpPacienteActivo;
+  document.getElementById('fp_contenido').innerHTML = `
+    <div class="ficha-grid">
+      <div class="ficha-item"><span class="ficha-label">Sexo</span><span class="ficha-val">${p.sexo || '—'}</span></div>
+      <div class="ficha-item"><span class="ficha-label">Peso</span><span class="ficha-val">${p.peso ? p.peso + ' kg' : '—'}</span></div>
+      <div class="ficha-item"><span class="ficha-label">Color</span><span class="ficha-val">${p.color || '—'}</span></div>
+      <div class="ficha-item"><span class="ficha-label">Microchip</span><span class="ficha-val">${p.microchip || '—'}</span></div>
+    </div>
+    ${p.alergias ? `<div class="ficha-dr-box"><div class="ficha-dr-label">⚠️ Alergias</div><div class="ficha-dr-txt">${p.alergias}</div></div>` : ''}
+    ${p.observaciones ? `<div class="ficha-dr-box"><div class="ficha-dr-label">📋 Observaciones</div><div class="ficha-dr-txt">${p.observaciones}</div></div>` : ''}
+  `;
+}
+async function renderFichaHistoria() {
+  const box = document.getElementById('fp_contenido');
+  box.innerHTML = 'Cargando...';
+  const d = await api(`/api/historias/${_fpPacienteActivo.id}`, { headers: authHeaders() });
+  const historias = d.ok ? d.historias : [];
+  box.innerHTML = historias.length ? historias.map(h => `
+    <div style="border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:8px;">
+      <strong style="font-size:13px;">${fmtFecha(h.fecha)}${h.motivo ? ' — ' + h.motivo : ''}</strong>
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-top:4px;line-height:1.6;">
+        ${h.diagnostico ? `<div><strong>Diagnóstico:</strong> ${h.diagnostico}</div>` : ''}
+        ${h.tratamiento ? `<div><strong>Tratamiento:</strong> ${h.tratamiento}</div>` : ''}
+      </div>
+    </div>`).join('') : '<p style="color:var(--ink-soft);font-size:13px;">Sin consultas registradas.</p>';
+}
+function fpNuevaConsulta() {
+  cerrarModal('mFichaPaciente');
+  ir('historia');
+  document.getElementById('hc_paciente_select').value = _fpPacienteActivo.id;
+  cargarHistoriaPaciente();
+  abrirNuevaConsulta();
+}
+function fpNuevaVenta() {
+  cerrarModal('mFichaPaciente');
+  ir('ventas');
+  abrirCrearVenta().then(() => {
+    document.getElementById('ve_cliente_id').value = _fpPacienteActivo.cliente_id;
+    poblarPacientesDeCliente('ve_paciente_id', _fpPacienteActivo.cliente_id).then(() => {
+      document.getElementById('ve_paciente_id').value = _fpPacienteActivo.id;
+    });
   });
 }
- 
-// ── (2) Rutas ────────────────────────────────────────────────
- 
-// Archivos de laboratorio (PDF) de una consulta
-app.get('/api/historia-archivos/:historia_id', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT id, nombre, url, created_at FROM historia_archivos WHERE historia_id=? AND empresa_id=? ORDER BY id`,
-    [req.params.historia_id, req.user.empresa_id]
-  );
-  res.json({ ok: true, archivos: rows });
-}));
- 
-app.post('/api/historia-archivos/:historia_id', verificarToken, requireRoles('propietario', 'veterinario'), uploadPdf.single('archivo'), ah(async (req, res) => {
-  if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió ningún PDF' });
-  const [h] = await pool.query('SELECT id FROM historias WHERE id=? AND empresa_id=?', [req.params.historia_id, req.user.empresa_id]);
-  if (!h.length) return res.status(404).json({ ok: false, error: 'Consulta no encontrada' });
-  const r = await subirPdfACloudinary(req.file.buffer, 'vetcore/laboratorio', req.file.originalname);
-  const [ins] = await pool.query(
-    `INSERT INTO historia_archivos (empresa_id, historia_id, nombre, url) VALUES (?,?,?,?)`,
-    [req.user.empresa_id, req.params.historia_id, req.file.originalname, r.secure_url]
-  );
-  res.json({ ok: true, id: ins.insertId, url: r.secure_url });
-}));
- 
-app.delete('/api/historia-archivos/:id', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  await pool.query('DELETE FROM historia_archivos WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true });
-}));
- 
-app.post('/api/hospitalizaciones', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const b = req.body || {}, eid = req.user.empresa_id;
-  if (!b.paciente_id || !b.motivo || !b.fecha_ingreso) return res.status(400).json({ ok: false, error: 'Faltan campos obligatorios' });
-  if (!b.consentimiento || !b.autorizante) return res.status(400).json({ ok: false, error: 'Falta consentimiento del propietario' });
 
-  const [pa] = await pool.query('SELECT id FROM pacientes WHERE id=? AND empresa_id=?', [b.paciente_id, eid]);
-  if (!pa.length) return res.status(404).json({ ok: false, error: 'Paciente no encontrado' });
-
-  const [act] = await pool.query("SELECT codigo FROM hospitalizaciones WHERE paciente_id=? AND empresa_id=? AND estado='activa'", [b.paciente_id, eid]);
-  if (act.length) return res.status(409).json({ ok: false, error: `Ya tiene una hospitalización activa (${act[0].codigo})` });
-
-  const [[u]] = await pool.query('SELECT nombre FROM usuarios WHERE id=?', [req.user.id]);
-  const [r] = await pool.query(
-    `INSERT INTO hospitalizaciones
-     (empresa_id,paciente_id,historia_id,fecha_ingreso,procedencia,veterinario,estado_inicial,area,jaula,peso_kg,
-      motivo,antecedentes,diagnostico,plan_inicial,consentimiento,autorizante,creado_por)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
-    [eid, b.paciente_id, b.historia_id || null, b.fecha_ingreso, b.procedencia || 'consulta', b.veterinario || '',
-     b.estado_inicial || 'Estable', b.area || '', b.jaula || '', b.peso_kg || null,
-     b.motivo, b.antecedentes || '', b.diagnostico || '', b.plan_inicial || '', b.autorizante, u?.nombre || '']);
-  const codigo = 'HOSP-' + String(r.insertId).padStart(4, '0');
-  await pool.query('UPDATE hospitalizaciones SET codigo=? WHERE id=?', [codigo, r.insertId]);
-  res.json({ ok: true, id: r.insertId, codigo });
-}));
-
-app.get('/api/pacientes/:id/hospitalizacion-activa', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const [rows] = await pool.query(
-    "SELECT * FROM hospitalizaciones WHERE paciente_id=? AND empresa_id=? AND estado='activa' LIMIT 1",
-    [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true, hospitalizacion: rows[0] || null });
-}));
-
-const SEL_HOSP = `SELECT h.*,
-  DATE_FORMAT(h.fecha_ingreso,'%Y-%m-%dT%H:%i:%s') AS ingreso_txt,
-  DATE_FORMAT(h.fecha_alta,'%Y-%m-%dT%H:%i:%s') AS alta_txt,
-  DATE_FORMAT(h.proximo_control,'%Y-%m-%d') AS control_txt,
-  pa.nombre AS paciente_nombre, pa.especie, pa.raza, pa.foto_url,
-  c.nombre AS cliente_nombre, c.telefono AS cliente_telefono
-  FROM hospitalizaciones h
-  JOIN pacientes pa ON pa.id=h.paciente_id
-  JOIN clientes c ON c.id=pa.cliente_id`;
-const hospRoles = requireRoles('propietario', 'veterinario', 'recepcion');
-const hospEscribe = requireRoles('propietario', 'veterinario');
-const FT = (c) => `DATE_FORMAT(${c},'%Y-%m-%dT%H:%i:%s')`;
-const nombreUsuario = async (id) => (await pool.query('SELECT nombre FROM usuarios WHERE id=?', [id]))[0][0]?.nombre || '';
-
-app.get('/api/hospitalizaciones', verificarToken, hospRoles, ah(async (req, res) => {
-  const e = req.query.estado;
-  const filtro = e === 'activa' || e === 'alta' ? ' AND h.estado=?' : '';
-  const params = [req.user.empresa_id]; if (filtro) params.push(e);
-  const [rows] = await pool.query(
-    `${SEL_HOSP} WHERE h.empresa_id=?${filtro} ORDER BY (h.estado='activa') DESC, h.fecha_ingreso DESC`, params);
-  res.json({ ok: true, hospitalizaciones: rows });
-}));
-
-app.post('/api/hospitalizaciones/:id/tratamientos', verificarToken, hospEscribe, ah(async (req, res) => {
-  if (!(await hospActiva(req, res))) return;
-  const b = req.body || {};
-  const horas = parseFloat(b.cada_horas) || 0, n = Math.min(Math.max(parseInt(b.num_dosis) || 1, 1), 60);
-  if (!String(b.producto || '').trim() || !b.primera) return res.status(400).json({ ok: false, error: 'Indica el medicamento y la hora de la primera dosis' });
-  if (n > 1 && horas <= 0) return res.status(400).json({ ok: false, error: 'Indica cada cuántas horas' });
-  const base = new Date(String(b.primera).replace(' ', 'T') + 'Z'); // se suma en UTC solo como aritmética de reloj
-  const grupo = 'T' + Date.now().toString(36), quien = await nombreUsuario(req.user.id);
-  const frec = n > 1 ? `cada ${horas} h × ${n}` : 'Dosis única';
-  const filas = Array.from({ length: n }, (_, i) => [
-    req.user.empresa_id, req.params.id, grupo, String(b.producto).trim(), b.dosis || '', b.via || '', frec, b.instrucciones || '',
-    new Date(base.getTime() + i * horas * 36e5).toISOString().slice(0, 19).replace('T', ' '), quien]);
-  await pool.query(
-    `INSERT INTO hosp_tratamientos (empresa_id,hospitalizacion_id,grupo,producto,dosis,via,frecuencia,instrucciones,programado,prescrito_por) VALUES ?`, [filas]);
-  res.json({ ok: true, dosis: n });
-}));
-
-app.put('/api/hosp-tratamientos/:id/estado', verificarToken, hospEscribe, ah(async (req, res) => {
-  const b = req.body || {};
-  if (!['realizado', 'no_administrado', 'omitido', 'cancelado'].includes(b.estado)) return res.status(400).json({ ok: false, error: 'Estado inválido' });
-  if (b.estado !== 'realizado' && !String(b.observaciones || '').trim()) return res.status(400).json({ ok: false, error: 'Indica el motivo' });
-  const [r] = await pool.query(
-    `UPDATE hosp_tratamientos t JOIN hospitalizaciones h ON h.id=t.hospitalizacion_id
-     SET t.estado=?, t.fecha_real=?, t.cantidad_real=?, t.observaciones=?, t.confirmado_por=?
-     WHERE t.id=? AND t.empresa_id=? AND t.estado='programado' AND h.estado='activa'`,
-    [b.estado, b.fecha_real || null, b.cantidad_real || '', b.observaciones || '', await nombreUsuario(req.user.id), req.params.id, req.user.empresa_id]);
-  if (!r.affectedRows) return res.status(400).json({ ok: false, error: 'Ese tratamiento ya fue registrado o la estancia está cerrada' });
-  res.json({ ok: true });
-}));
-
-
-app.get('/api/hospitalizaciones/:id', verificarToken, hospRoles, ah(async (req, res) => {
-  const [r] = await pool.query(`${SEL_HOSP} WHERE h.id=? AND h.empresa_id=?`, [req.params.id, req.user.empresa_id]);
-  if (!r[0]) return res.status(404).json({ ok: false, error: 'Hospitalización no encontrada' });
-  const [monitoreo] = await pool.query(
-    `SELECT *, ${FT('fecha')} AS fecha_txt FROM hosp_monitoreo WHERE hospitalizacion_id=? AND empresa_id=? ORDER BY fecha DESC, id DESC`,
-    [req.params.id, req.user.empresa_id]);
-  const [notas] = await pool.query(
-    `SELECT *, ${FT('fecha')} AS fecha_txt FROM hosp_notas WHERE hospitalizacion_id=? AND empresa_id=? ORDER BY fecha DESC, id DESC`,
-    [req.params.id, req.user.empresa_id]);
-  const [tratamientos] = await pool.query(
-    `SELECT *, ${FT('programado')} AS prog_txt, ${FT('fecha_real')} AS real_txt FROM hosp_tratamientos
-     WHERE hospitalizacion_id=? AND empresa_id=? ORDER BY programado ASC, id ASC`,
-    [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true, hospitalizacion: r[0], monitoreo, notas, tratamientos });
-}));
-
-async function hospActiva(req, res) {
-  const [r] = await pool.query("SELECT id FROM hospitalizaciones WHERE id=? AND empresa_id=? AND estado='activa'", [req.params.id, req.user.empresa_id]);
-  if (!r.length) { res.status(400).json({ ok: false, error: 'La hospitalización no existe o ya tiene alta' }); return false; }
-  return true;
+// ══════════════════════════════════════════════════════════════
+// FOTO DE MASCOTA (Cloudinary)
+// ══════════════════════════════════════════════════════════════
+let _pacienteFotoFile = null;
+function previsualizarFotoPaciente(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  _pacienteFotoFile = file;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    document.getElementById('pa_foto_preview_box').innerHTML = `<img src="${ev.target.result}" class="pac-foto-preview">`;
+  };
+  reader.readAsDataURL(file);
+}
+async function subirFotoPacienteSiHay(pacienteId) {
+  if (!_pacienteFotoFile) return true;
+  const fd = new FormData();
+  fd.append('foto', _pacienteFotoFile);
+  try {
+    const res = await fetch(API + `/api/pacientes/${pacienteId}/foto`, {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + getToken() }, body: fd
+    });
+    const data = await res.json();
+    _pacienteFotoFile = null;
+    if (!data.ok) { toast('Error subiendo foto: ' + (data.error || 'desconocido'), 'rojo'); return false; }
+    return true;
+  } catch (e) {
+    toast('Error de red subiendo la foto', 'rojo');
+    _pacienteFotoFile = null;
+    return false;
+  }
 }
 
-app.post('/api/hospitalizaciones/:id/monitoreo', verificarToken, hospEscribe, ah(async (req, res) => {
-  if (!(await hospActiva(req, res))) return;
-  const b = req.body || {};
-  if (!b.fecha) return res.status(400).json({ ok: false, error: 'Falta la fecha' });
-  const campos = ['temperatura','fc','fr','mucosas','tllc','hidratacion_pct','consumo_agua','consumo_alimento','orina','heces','vomito','dolor','observaciones'];
-  if (!campos.some(k => b[k])) return res.status(400).json({ ok: false, error: 'Registra al menos una medición' });
-  await pool.query(
-    `INSERT INTO hosp_monitoreo (empresa_id,hospitalizacion_id,fecha,temperatura,fc,fr,mucosas,tllc,hidratacion_pct,
-       consumo_agua,consumo_alimento,orina,heces,vomito,dolor,hidratacion,observaciones,usuario)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [req.user.empresa_id, req.params.id, b.fecha, b.temperatura || null, b.fc || '', b.fr || '', b.mucosas || '',
-     b.tllc || '', b.hidratacion_pct || '', b.consumo_agua || '', b.consumo_alimento || '', b.orina || '',
-     b.heces || '', b.vomito || '', b.dolor || '', b.hidratacion || '', b.observaciones || '',
-     await nombreUsuario(req.user.id)]);
-  res.json({ ok: true });
-}));
+// ══════════════════════════════════════════════════════════════
+// ATENCIÓN — sala de espera (flujo central)
+// ══════════════════════════════════════════════════════════════
+let _atenciones = [];
+const prioridadLabel = { emergencia: 'Emergencia', urgente: 'Urgente', prioritario: 'Prioritario', normal: 'Normal' };
+const estadoAtencionLabel = { llegada: 'Llegada', triaje: 'Triaje', espera: 'En espera', consulta: 'Consulta', diagnostico: 'Diagnóstico', tratamiento: 'Tratamiento', venta: 'Venta/Pago', seguimiento: 'Seguimiento', cerrada: 'Cerrada' };
+const flujoEstados = ['llegada','triaje','espera','consulta','diagnostico','tratamiento','venta','seguimiento','cerrada'];
 
-// Medicamentos usados antes en hospitalización (última dosis/vía/instrucciones de cada uno)
-app.get('/api/hosp-medicamentos', verificarToken, hospEscribe, ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT t.producto, t.dosis, t.via, t.instrucciones
-     FROM hosp_tratamientos t
-     JOIN (SELECT MAX(id) AS id FROM hosp_tratamientos WHERE empresa_id=? GROUP BY producto) u ON u.id = t.id
-     ORDER BY t.producto LIMIT 500`,
-    [req.user.empresa_id]);
-  res.json({ ok: true, medicamentos: rows });
-}));
-
-
-app.post('/api/hospitalizaciones/:id/notas', verificarToken, hospEscribe, ah(async (req, res) => {
-  if (!(await hospActiva(req, res))) return;
-  const b = req.body || {};
-  if (!b.fecha || !String(b.nota || '').trim()) return res.status(400).json({ ok: false, error: 'Escribe la nota' });
-  await pool.query(
-    `INSERT INTO hosp_notas (empresa_id,hospitalizacion_id,fecha,tipo,nota,usuario) VALUES (?,?,?,?,?,?)`,
-    [req.user.empresa_id, req.params.id, b.fecha, ['evolucion', 'incidencia', 'relevo'].includes(b.tipo) ? b.tipo : 'evolucion',
-     String(b.nota).trim(), await nombreUsuario(req.user.id)]);
-  res.json({ ok: true });
-}));
-
-app.put('/api/hospitalizaciones/:id/alta', verificarToken, hospEscribe, ah(async (req, res) => {
-  if (!(await hospActiva(req, res))) return;
-  const b = req.body || {};
-  if (!b.fecha_alta || !b.condicion_alta || !String(b.resumen_alta || '').trim())
-    return res.status(400).json({ ok: false, error: 'Completa fecha, condición y resumen del alta' });
-  await pool.query(
-    `UPDATE hospitalizaciones SET estado='alta', fecha_alta=?, condicion_alta=?, resumen_alta=?, indicaciones_alta=?, proximo_control=?, alta_por=?
-     WHERE id=? AND empresa_id=?`,
-    [b.fecha_alta, b.condicion_alta, String(b.resumen_alta).trim(), b.indicaciones_alta || '', b.proximo_control || null,
-     await nombreUsuario(req.user.id), req.params.id, req.user.empresa_id]);
-  res.json({ ok: true });
-}));
+async function cargarAtenciones() {
+  await asegurarVeterinariosCargados();
+  const d = await api('/api/atenciones', { headers: authHeaders() });
+  _atenciones = d.ok ? d.atenciones : [];
+  renderAtenciones();
+}
+function renderAtenciones() {
+  const box = document.getElementById('atencionLista');
+  if (!_atenciones.length) { box.innerHTML = '<p style="color:var(--ink-soft);font-size:13.5px;">No hay pacientes en atención activa.</p>'; return; }
+  box.innerHTML = _atenciones.map(a => {
+    const idx = flujoEstados.indexOf(a.estado);
+    const siguiente = flujoEstados[idx + 1];
+    return `
+    <div class="atencion-card ${a.prioridad}">
+      <div style="flex:1;">
+        <strong>${a.paciente_nombre}</strong> <span style="color:var(--ink-soft);font-size:13px;">— ${a.cliente_nombre}</span>
+        <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;">
+          <span class="badge b-${a.prioridad}">${prioridadLabel[a.prioridad]}</span>
+          <span class="badge b-grey">${estadoAtencionLabel[a.estado]}</span>
+          ${a.veterinario_nombre ? `<span class="badge b-primary">${a.veterinario_nombre}</span>` : `<select onchange="asignarVeterinario(${a.id}, this.value)" style="padding:2px 6px;border-radius:6px;border:1px solid var(--border);font-size:11.5px;">${['<option value="">Asignar vet.</option>'].concat(_veterinarios.map(v=>`<option value="${v.id}">${v.nombre}</option>`)).join('')}</select>`}
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-ghost btn-sm" onclick="abrirFichaPaciente(${a.paciente_id})">Ver ficha</button>
+        ${siguiente && siguiente !== 'cerrada' ? `<button class="btn btn-primary btn-sm" onclick="avanzarAtencion(${a.id},'${siguiente}')">Avanzar → ${estadoAtencionLabel[siguiente]}</button>` : ''}
+        ${siguiente === 'cerrada' ? `<button class="btn btn-primary btn-sm" onclick="avanzarAtencion(${a.id},'cerrada')">Cerrar atención</button>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+async function asignarVeterinario(id, veterinario_id) {
+  if (!veterinario_id) return;
+  const d = await api(`/api/atenciones/${id}/asignar`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ veterinario_id }) });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Veterinario asignado', 'verde');
+  cargarAtenciones();
+}
+async function avanzarAtencion(id, estado) {
+  const d = await api(`/api/atenciones/${id}/estado`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ estado }) });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Atención actualizada', 'verde');
+  cargarAtenciones();
+}
+async function abrirCrearAtencion() {
+  await Promise.all([asegurarClientesCargados(), asegurarVeterinariosCargados()]);
+  poblarSelectClientes('at_cliente_id');
+  poblarSelectVeterinarios('at_veterinario_id');
+  document.getElementById('at_paciente_id').innerHTML = '<option value="">— Selecciona un cliente primero —</option>';
+  document.getElementById('at_origen').value = 'sin_cita';
+  document.getElementById('at_prioridad').value = 'normal';
+  abrirModal('mAtencion');
+}
+async function guardarAtencion() {
+  const cliente_id = document.getElementById('at_cliente_id').value;
+  const paciente_id = document.getElementById('at_paciente_id').value;
+  if (!cliente_id || !paciente_id) { toast('Selecciona cliente y mascota', 'rojo'); return; }
+  const body = {
+    cliente_id, paciente_id,
+    veterinario_id: document.getElementById('at_veterinario_id').value || null,
+    origen: document.getElementById('at_origen').value,
+    prioridad: document.getElementById('at_prioridad').value,
+  };
+  const d = await api('/api/atenciones', { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Atención registrada', 'verde');
+  cerrarModal('mAtencion');
+  cargarAtenciones();
+}
 
 // ══════════════════════════════════════════════════════════════
-// RECETAS — propietario y veterinario
+// PERSONAL — el propietario administra a su equipo
 // ══════════════════════════════════════════════════════════════
-const recRoles = requireRoles('propietario', 'veterinario');
-
-app.get('/api/recetas', verificarToken, recRoles, ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT id, numero, DATE_FORMAT(fecha,'%Y-%m-%d') AS fecha, prescripcion, indicaciones, imagen_url
-     FROM recetas WHERE empresa_id=? AND paciente_id=? AND imagen_url<>'' ORDER BY id DESC`,
-    [req.user.empresa_id, req.query.paciente_id]);
-  res.json({ ok: true, recetas: rows });
-}));
-
-app.post('/api/recetas', verificarToken, recRoles, ah(async (req, res) => {
-  const b = req.body || {}, eid = req.user.empresa_id;
-  if (!b.paciente_id || !b.fecha) return res.status(400).json({ ok: false, error: 'Paciente y fecha son obligatorios' });
-  const [pa] = await pool.query('SELECT id FROM pacientes WHERE id=? AND empresa_id=?', [b.paciente_id, eid]);
-  if (!pa.length) return res.status(404).json({ ok: false, error: 'Paciente no encontrado' });
-  const [[{ n }]] = await pool.query('SELECT COALESCE(MAX(numero),0)+1 AS n FROM recetas WHERE empresa_id=?', [eid]);
-   const [r] = await pool.query(
-    `INSERT INTO recetas (empresa_id,paciente_id,historia_id,numero,fecha,prescripcion,indicaciones,veterinario_id)
-     VALUES (?,?,?,?,?,?,?,?)`,
-    [eid, b.paciente_id, b.historia_id || null, n, b.fecha, b.prescripcion || '', b.indicaciones || '', req.user.id]);
-  res.json({ ok: true, id: r.insertId, numero: n });
-}));
-
-app.post('/api/recetas/:id/imagen', verificarToken, recRoles, upload.single('imagen'), ah(async (req, res) => {
-  if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió la imagen' });
-  const [r] = await pool.query('SELECT id FROM recetas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  if (!r.length) return res.status(404).json({ ok: false, error: 'Receta no encontrada' });
-  const up = await subirACloudinary(req.file.buffer, 'vetcore/recetas');
-  await pool.query('UPDATE recetas SET imagen_url=? WHERE id=?', [up.secure_url, req.params.id]);
-
-  res.json({ ok: true, imagen_url: up.secure_url });
-}));
-
-app.delete('/api/recetas/:id', verificarToken, recRoles, ah(async (req, res) => {
-  await pool.query('DELETE FROM recetas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true });
-}));
+let _personal = [];
+const rolPersonalLabel = { propietario: 'Propietario', veterinario: 'Veterinario', recepcion: 'Recepción' };
+async function cargarPersonal() {
+  const d = await api('/api/personal', { headers: authHeaders() });
+  _personal = d.ok ? d.personal : [];
+  document.getElementById('tbStaff').innerHTML = _personal.length
+    ? _personal.map(s => `<tr>
+        <td><strong>${s.nombre || '—'}</strong></td>
+        <td>${s.email}</td>
+        <td><span class="badge b-primary">${rolPersonalLabel[s.rol] || s.rol}</span></td>
+        <td>${s.activo ? '<span class="badge b-primary">Activa</span>' : '<span class="badge b-danger">Desactivada</span>'}</td>
+        <td>${s.rol === 'propietario' ? '' : `<button class="btn btn-ghost btn-sm" onclick="abrirEditarPersonal(${s.id})">Editar</button>`}</td>
+      </tr>`).join('')
+    : '<tr class="empty-row"><td colspan="5">Sin personal registrado</td></tr>';
+}
+function abrirEditarPersonal(id) {
+  const s = _personal.find(x => x.id === id); if (!s) return;
+  document.getElementById('st_id').value = s.id;
+  document.getElementById('mStaffSub').textContent = `${rolPersonalLabel[s.rol]} — ${s.email}`;
+  document.getElementById('st_nombre').value = s.nombre || '';
+  document.getElementById('st_password').value = '';
+  document.getElementById('st_activo').value = s.activo ? '1' : '0';
+  abrirModal('mStaff');
+}
+async function guardarPersonal() {
+  const id = document.getElementById('st_id').value;
+  const body = {
+    nombre: document.getElementById('st_nombre').value.trim(),
+    activo: document.getElementById('st_activo').value,
+    password: document.getElementById('st_password').value || undefined,
+  };
+  const d = await api(`/api/personal/${id}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify(body) });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Personal actualizado', 'verde');
+  cerrarModal('mStaff');
+  cargarPersonal();
+}
 
 // ══════════════════════════════════════════════════════════════
-// REPORTES v2 — repositorio documental, ventas, movimientos
+// CAJA
 // ══════════════════════════════════════════════════════════════
-// Repositorio: recetas + PDFs de laboratorio. El veterinario solo ve los suyos.
-app.get('/api/documentos', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const eid = req.user.empresa_id, esVet = req.user.rol === 'veterinario';
-  const [[u]] = await pool.query('SELECT nombre FROM usuarios WHERE id=?', [req.user.id]);
-  const pr = [eid], pl = [eid];
-  let fr = '', fl = '';
-  if (esVet) { fr = ' AND r.veterinario_id=?'; pr.push(req.user.id); fl = ' AND h.atendio=?'; pl.push(u?.nombre || ''); }
-  const [rows] = await pool.query(
-    `SELECT * FROM (
-       SELECT 'receta' AS tipo, r.id, CONCAT('Receta Nº ', LPAD(r.numero,5,'0')) AS nombre, r.imagen_url AS url,
-              DATE_FORMAT(r.fecha,'%Y-%m-%d') AS fecha, r.paciente_id, r.historia_id,
-              pa.nombre AS paciente_nombre, c.nombre AS cliente_nombre, vu.nombre AS veterinario
-       FROM recetas r
-       JOIN pacientes pa ON pa.id=r.paciente_id
-       JOIN clientes c ON c.id=pa.cliente_id
-       LEFT JOIN usuarios vu ON vu.id=r.veterinario_id
-       WHERE r.empresa_id=? AND r.imagen_url<>''${fr}
-       UNION ALL
-       SELECT 'laboratorio' AS tipo, ha.id, ha.nombre, ha.url,
-              DATE_FORMAT(ha.created_at,'%Y-%m-%d') AS fecha, h.paciente_id, h.id AS historia_id,
-              pa.nombre AS paciente_nombre, c.nombre AS cliente_nombre, h.atendio AS veterinario
-       FROM historia_archivos ha
-       JOIN historias h ON h.id=ha.historia_id
-       JOIN pacientes pa ON pa.id=h.paciente_id
-       JOIN clientes c ON c.id=pa.cliente_id
-       WHERE ha.empresa_id=?${fl}
-     ) d ORDER BY fecha DESC, id DESC LIMIT 500`,
-    [...pr, ...pl]);
-  res.json({ ok: true, documentos: rows });
-}));
+async function cargarCaja() {
+  const desde = document.getElementById('cj_desde').value;
+  const hasta = document.getElementById('cj_hasta').value;
+  const qs = desde && hasta ? `?desde=${desde}&hasta=${hasta}` : '';
+  const d = await api('/api/caja' + qs, { headers: authHeaders() });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  if (!desde) document.getElementById('cj_desde').value = d.desde;
+  if (!hasta) document.getElementById('cj_hasta').value = d.hasta;
+  document.getElementById('cj-total').textContent = fmtMoney(d.total);
+  document.getElementById('cj-cantidad').textContent = d.cantidad;
+  document.getElementById('cj-pendiente').textContent = fmtMoney(d.pendiente?.total || 0);
+  document.getElementById('tbCajaMetodo').innerHTML = d.porMetodo.length
+    ? d.porMetodo.map(m => `<tr><td>${m.metodo}</td><td>${m.cantidad}</td><td>${fmtMoney(m.total)}</td></tr>`).join('')
+    : '<tr class="empty-row"><td colspan="3">Sin movimientos en este rango</td></tr>';
+  document.getElementById('tbCajaDia').innerHTML = (d.porDia || []).length
+    ? d.porDia.map(x => `<tr><td>${fmtFecha(x.dia)}</td><td>${x.cantidad}</td><td>${fmtMoney(x.total)}</td></tr>`).join('')
+    : '<tr class="empty-row"><td colspan="3">Sin datos</td></tr>';
+}
 
-// Informe de ventas y cobros (el veterinario solo ve las suyas)
-app.get('/api/reportes/ventas', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const eid = req.user.empresa_id;
-  const valida = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
-  const [[f]] = await pool.query(`SELECT DATE_FORMAT(CURDATE(),'%Y-%m-%d') AS hoy, DATE_FORMAT(CURDATE(),'%Y-%m-01') AS inicio`);
-  const desde = valida(req.query.desde) ? req.query.desde : f.inicio;
-  const hasta = valida(req.query.hasta) ? req.query.hasta : f.hoy;
-  const p = [eid, desde, hasta]; let fv = '';
-  if (req.user.rol === 'veterinario') { fv = ' AND veterinario_id=?'; p.push(req.user.id); }
-  const base = `FROM ventas WHERE empresa_id=? AND DATE(created_at) BETWEEN ? AND ?${fv}`;
-  const [porMetodo] = await pool.query(
-    `SELECT metodo_pago AS metodo, COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total ${base} AND estado_pago='pagado' GROUP BY metodo_pago`, p);
-  const [[pendiente]] = await pool.query(
-    `SELECT COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total ${base} AND estado_pago<>'pagado'`, p);
-  const [porDia] = await pool.query(
-    `SELECT DATE_FORMAT(created_at,'%Y-%m-%d') AS dia, COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total
-     ${base} AND estado_pago='pagado' GROUP BY DATE_FORMAT(created_at,'%Y-%m-%d') ORDER BY dia DESC`, p);
-  res.json({ ok: true, desde, hasta, porMetodo, pendiente, porDia });
-}));
+// ══════════════════════════════════════════════════════════════
+// REPORTES
+// ══════════════════════════════════════════════════════════════
+async function cargarReportes() {
+  const desde = document.getElementById('rp_desde').value;
+  const hasta = document.getElementById('rp_hasta').value;
+  const qs = desde && hasta ? `?desde=${desde}&hasta=${hasta}` : '';
+  const d = await api('/api/reportes' + qs, { headers: authHeaders() });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  if (!desde) document.getElementById('rp_desde').value = d.desde;
+  if (!hasta) document.getElementById('rp_hasta').value = d.hasta;
+  document.getElementById('rp-consultas').textContent = d.consultas ?? '—';
+  document.getElementById('tbRepCitas').innerHTML = d.citasPorEstado.length
+    ? d.citasPorEstado.map(c => `<tr><td>${c.estado}</td><td>${c.total}</td></tr>`).join('')
+    : '<tr class="empty-row"><td colspan="2">Sin datos</td></tr>';
+  document.getElementById('tbRepVet').innerHTML = (d.porVeterinario || []).length
+    ? d.porVeterinario.map(v => `<tr><td>${v.veterinario}</td><td>${v.total}</td></tr>`).join('')
+    : '<tr class="empty-row"><td colspan="2">Sin datos</td></tr>';
+  document.getElementById('tbRepProductos').innerHTML = (d.topProductos || []).length
+    ? d.topProductos.map(p => `<tr><td>${p.nombre}</td><td>${p.cantidad}</td><td>${fmtMoney(p.total)}</td></tr>`).join('')
+    : '<tr class="empty-row"><td colspan="3">Sin datos</td></tr>';
+}
 
-// Últimos movimientos de inventario (kardex general)
-app.get('/api/reportes/movimientos', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT m.*, p.nombre AS producto, u.nombre AS usuario_nombre
-     FROM movimientos_stock m
-     JOIN productos p ON p.id=m.producto_id
-     LEFT JOIN usuarios u ON u.id=m.usuario_id
-     WHERE m.empresa_id=? ORDER BY m.id DESC LIMIT 100`, [req.user.empresa_id]);
-  res.json({ ok: true, movimientos: rows });
-}));
+// ══════════════════════════════════════════════════════════════
+// CONFIGURACIÓN
+// ══════════════════════════════════════════════════════════════
+async function cargarConfiguracion() {
+  const d = await api('/api/configuracion', { headers: authHeaders() });
+  if (!d.ok) return;
+  document.getElementById('cf_nombre').value = d.configuracion.nombre_clinica || '';
+  document.getElementById('cf_plan').value = d.configuracion.plan_nombre || 'Sin plan';
+  document.getElementById('cf_pass_actual').value = '';
+  document.getElementById('cf_pass_nueva').value = '';
+}
+async function guardarConfiguracion() {
+  const nombre_clinica = document.getElementById('cf_nombre').value.trim();
+  if (!nombre_clinica) { toast('El nombre de la clínica es obligatorio', 'rojo'); return; }
+  const d = await api('/api/configuracion', { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ nombre_clinica }) });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Clínica actualizada', 'verde');
+  document.getElementById('clinicaTag').textContent = user.plan_nombre || nombre_clinica;
+}
+async function cambiarPassword() {
+  const actual = document.getElementById('cf_pass_actual').value;
+  const nueva = document.getElementById('cf_pass_nueva').value;
+  if (!actual || !nueva) { toast('Completa ambos campos', 'rojo'); return; }
+  const d = await api('/api/auth/password', { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ actual, nueva }) });
+  if (!d.ok) { toast(d.error || 'Error', 'rojo'); return; }
+  toast('Contraseña actualizada', 'verde');
+  document.getElementById('cf_pass_actual').value = '';
+  document.getElementById('cf_pass_nueva').value = '';
+}
+async function descargarRespaldo() {
+  try {
+    const res = await fetch(API + '/api/respaldo', { headers: authHeaders() });
+    const data = await res.json();
+    if (!data.ok) { toast(data.error || 'Error generando el respaldo', 'rojo'); return; }
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `respaldo-vetcore-${new Date().toISOString().slice(0,10)}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    toast('Error de red generando el respaldo', 'rojo');
+  }
+}
 
-
-
-
-
-// ── Salud del servicio ───────────────────────────────────────
-app.get('/', (req, res) => res.json({ ok: true, servicio: 'Vetcore API' }));
-
-
-
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`🐾 Vetcore API corriendo en el puerto ${PORT}`));
+// ══════════════════════════════════════════════════════════════
+// INIT
+// ══════════════════════════════════════════════════════════════
+cargarResumen();
