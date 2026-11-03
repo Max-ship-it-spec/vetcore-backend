@@ -151,7 +151,6 @@ async function descontarVenta(conn, empresaId, productoId, cantidad, usuarioId) 
     await moverStock(conn, { empresaId, productoId, almacenId: f.almacen_id, delta: -tomar, tipo: 'venta', motivo: 'Venta', usuarioId });
     falta -= tomar;
   }
-  if (falta > 0) throw new Error('Stock insuficiente para completar la venta');
 }
 
 function datosProducto(b) {
@@ -893,89 +892,46 @@ app.post('/api/stock-documentos', verificarToken, requireRoles('propietario', 'r
 // ══════════════════════════════════════════════════════════════
 app.get('/api/ventas', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
   const [rows] = await pool.query(
-    `SELECT v.*, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre, vet.nombre AS veterinario_nombre
+    `SELECT v.*, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre
      FROM ventas v
      LEFT JOIN clientes c ON c.id = v.cliente_id
      LEFT JOIN pacientes pa ON pa.id = v.paciente_id
-     LEFT JOIN usuarios vet ON vet.id = v.veterinario_id
      WHERE v.empresa_id=? ORDER BY v.id DESC`, [req.user.empresa_id]
   );
   res.json({ ok: true, ventas: rows });
 }));
 
-
 app.post('/api/ventas', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const { cliente_id, paciente_id, historia_id, items, descuento, metodo_pago, estado_pago,
-            referencia, tipo_tarjeta, recibido, cambio } = req.body || {};
+    const { cliente_id, paciente_id, items, descuento, metodo_pago, estado_pago } = req.body || {};
     if (!Array.isArray(items) || !items.length) return res.status(400).json({ ok: false, error: 'Agrega al menos un producto o servicio' });
-    const eid = req.user.empresa_id;
 
     await conn.beginTransaction();
-    if (historia_id) {
-      const [dup] = await conn.query('SELECT id FROM ventas WHERE historia_id=? AND empresa_id=?', [historia_id, eid]);
-      if (dup.length) throw new Error('Esta consulta ya tiene una venta registrada');
-    }
-
-    let subtotal = 0; const lineas = [];
+    let subtotal = 0;
     for (const item of items) {
-      const cant = Math.max(1, parseInt(item.cantidad) || 1);
-      let nombre = item.nombre, precio = Number(item.precio) || 0;
+      subtotal += Number(item.precio) * Number(item.cantidad || 1);
       if (item.producto_id) {
-        const [[p]] = await conn.query('SELECT nombre, precio_venta FROM productos WHERE id=? AND empresa_id=?', [item.producto_id, eid]);
-        if (!p) throw new Error('Producto no encontrado');
-        nombre = p.nombre; precio = Number(p.precio_venta);
-        await descontarVenta(conn, eid, item.producto_id, cant, req.user.id);
+        await descontarVenta(conn, req.user.empresa_id, item.producto_id, Number(item.cantidad || 1), req.user.id);
       }
-      subtotal += precio * cant;
-      lineas.push({ producto_id: item.producto_id || null, nombre, precio, cantidad: cant });
     }
     const total = Math.max(subtotal - Number(descuento || 0), 0);
     const estado = estado_pago === 'pendiente' ? 'pendiente' : 'pagado';
-    const [[{ n }]] = await conn.query('SELECT COALESCE(MAX(numero),0)+1 AS n FROM ventas WHERE empresa_id=?', [eid]);
-
     const [result] = await conn.query(
-      `INSERT INTO ventas (empresa_id, numero, cliente_id, paciente_id, historia_id, veterinario_id, items_json, subtotal, descuento, total,
-                           metodo_pago, estado_pago, referencia, tipo_tarjeta, recibido, cambio)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [eid, n, cliente_id || null, paciente_id || null, historia_id || null,
-       req.user.rol === 'veterinario' ? req.user.id : null, JSON.stringify(lineas),
-       subtotal, descuento || 0, total, metodo_pago || 'efectivo', estado,
-       referencia || '', tipo_tarjeta || '', recibido ?? null, cambio ?? null]
+      `INSERT INTO ventas (empresa_id, cliente_id, paciente_id, items_json, subtotal, descuento, total, metodo_pago, estado_pago)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+      [req.user.empresa_id, cliente_id || null, paciente_id || null, JSON.stringify(items),
+       subtotal, descuento || 0, total, metodo_pago || 'efectivo', estado]
     );
     await conn.commit();
-    res.json({ ok: true, id: result.insertId, numero: n, total });
+    res.json({ ok: true, id: result.insertId, total });
   } catch (e) {
     await conn.rollback();
-    res.status(400).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: e.message });
   } finally {
     conn.release();
   }
 });
-
-app.post('/api/ventas/:id/comprobante', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), upload.single('comprobante'), ah(async (req, res) => {
-  if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió la imagen' });
-  const [r] = await pool.query('SELECT id FROM ventas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  if (!r.length) return res.status(404).json({ ok: false, error: 'Venta no encontrada' });
-  const up = await subirACloudinary(req.file.buffer, 'vetcore/comprobantes');
-  await pool.query('UPDATE ventas SET comprobante_url=? WHERE id=?', [up.secure_url, req.params.id]);
-  res.json({ ok: true, comprobante_url: up.secure_url });
-}));
-
-// Precios de servicios (Configuración): todos leen, solo propietario edita
-app.get('/api/servicios', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const [rows] = await pool.query('SELECT nombre, precio FROM servicios WHERE empresa_id=? ORDER BY nombre', [req.user.empresa_id]);
-  res.json({ ok: true, servicios: rows });
-}));
-app.put('/api/servicios', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
-  const { nombre, precio } = req.body || {};
-  if (!nombre) return res.status(400).json({ ok: false, error: 'Nombre obligatorio' });
-  await pool.query(
-    'INSERT INTO servicios (empresa_id, nombre, precio) VALUES (?,?,?) ON DUPLICATE KEY UPDATE precio=VALUES(precio)',
-    [req.user.empresa_id, nombre, Number(precio) || 0]);
-  res.json({ ok: true });
-}));
 
 // "Registrar pago" de una venta que quedó pendiente
 app.put('/api/ventas/:id/pago', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
@@ -1349,70 +1305,7 @@ app.delete('/api/recetas/:id', verificarToken, recRoles, ah(async (req, res) => 
   res.json({ ok: true });
 }));
 
-// ══════════════════════════════════════════════════════════════
-// REPORTES v2 — repositorio documental, ventas, movimientos
-// ══════════════════════════════════════════════════════════════
-// Repositorio: recetas + PDFs de laboratorio. El veterinario solo ve los suyos.
-app.get('/api/documentos', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const eid = req.user.empresa_id, esVet = req.user.rol === 'veterinario';
-  const [[u]] = await pool.query('SELECT nombre FROM usuarios WHERE id=?', [req.user.id]);
-  const pr = [eid], pl = [eid];
-  let fr = '', fl = '';
-  if (esVet) { fr = ' AND r.veterinario_id=?'; pr.push(req.user.id); fl = ' AND h.atendio=?'; pl.push(u?.nombre || ''); }
-  const [rows] = await pool.query(
-    `SELECT * FROM (
-       SELECT 'receta' AS tipo, r.id, CONCAT('Receta Nº ', LPAD(r.numero,5,'0')) AS nombre, r.imagen_url AS url,
-              DATE_FORMAT(r.fecha,'%Y-%m-%d') AS fecha, r.paciente_id, r.historia_id,
-              pa.nombre AS paciente_nombre, c.nombre AS cliente_nombre, vu.nombre AS veterinario
-       FROM recetas r
-       JOIN pacientes pa ON pa.id=r.paciente_id
-       JOIN clientes c ON c.id=pa.cliente_id
-       LEFT JOIN usuarios vu ON vu.id=r.veterinario_id
-       WHERE r.empresa_id=? AND r.imagen_url<>''${fr}
-       UNION ALL
-       SELECT 'laboratorio' AS tipo, ha.id, ha.nombre, ha.url,
-              DATE_FORMAT(ha.created_at,'%Y-%m-%d') AS fecha, h.paciente_id, h.id AS historia_id,
-              pa.nombre AS paciente_nombre, c.nombre AS cliente_nombre, h.atendio AS veterinario
-       FROM historia_archivos ha
-       JOIN historias h ON h.id=ha.historia_id
-       JOIN pacientes pa ON pa.id=h.paciente_id
-       JOIN clientes c ON c.id=pa.cliente_id
-       WHERE ha.empresa_id=?${fl}
-     ) d ORDER BY fecha DESC, id DESC LIMIT 500`,
-    [...pr, ...pl]);
-  res.json({ ok: true, documentos: rows });
-}));
 
-// Informe de ventas y cobros (el veterinario solo ve las suyas)
-app.get('/api/reportes/ventas', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const eid = req.user.empresa_id;
-  const valida = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
-  const [[f]] = await pool.query(`SELECT DATE_FORMAT(CURDATE(),'%Y-%m-%d') AS hoy, DATE_FORMAT(CURDATE(),'%Y-%m-01') AS inicio`);
-  const desde = valida(req.query.desde) ? req.query.desde : f.inicio;
-  const hasta = valida(req.query.hasta) ? req.query.hasta : f.hoy;
-  const p = [eid, desde, hasta]; let fv = '';
-  if (req.user.rol === 'veterinario') { fv = ' AND veterinario_id=?'; p.push(req.user.id); }
-  const base = `FROM ventas WHERE empresa_id=? AND DATE(created_at) BETWEEN ? AND ?${fv}`;
-  const [porMetodo] = await pool.query(
-    `SELECT metodo_pago AS metodo, COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total ${base} AND estado_pago='pagado' GROUP BY metodo_pago`, p);
-  const [[pendiente]] = await pool.query(
-    `SELECT COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total ${base} AND estado_pago<>'pagado'`, p);
-  const [porDia] = await pool.query(
-    `SELECT DATE_FORMAT(created_at,'%Y-%m-%d') AS dia, COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total
-     ${base} AND estado_pago='pagado' GROUP BY DATE_FORMAT(created_at,'%Y-%m-%d') ORDER BY dia DESC`, p);
-  res.json({ ok: true, desde, hasta, porMetodo, pendiente, porDia });
-}));
-
-// Últimos movimientos de inventario (kardex general)
-app.get('/api/reportes/movimientos', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT m.*, p.nombre AS producto, u.nombre AS usuario_nombre
-     FROM movimientos_stock m
-     JOIN productos p ON p.id=m.producto_id
-     LEFT JOIN usuarios u ON u.id=m.usuario_id
-     WHERE m.empresa_id=? ORDER BY m.id DESC LIMIT 100`, [req.user.empresa_id]);
-  res.json({ ok: true, movimientos: rows });
-}));
 
 
 
