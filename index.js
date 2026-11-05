@@ -121,8 +121,47 @@ async function almacenPrincipal(db, empresaId) {
   return ins.insertId;
 }
 
-// Suma/resta stock en un almacén, mantiene productos.stock (total) y registra el kardex
-async function moverStock(conn, { empresaId, productoId, almacenId, delta, tipo, motivo, usuarioId, docId = null }) {
+// ── Constantes de ventas ─────────────────────────────────────
+const IVA_PCT = Number(process.env.IVA_PCT || 0);                 // Ecuador: 15
+const DESC_MAX_PCT = Number(process.env.DESCUENTO_MAX_PCT || 10); // tope para recepción/veterinario
+const METODOS = ['efectivo', 'tarjeta', 'transferencia'];
+const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const numVenta = (n) => 'V-' + String(n).padStart(4, '0');
+const parseItems = (j) => { try { return typeof j === 'string' ? JSON.parse(j) : (j || []); } catch (e) { return []; } };
+
+// ── Auditoría y notificaciones ───────────────────────────────
+async function audit(db, req, accion, entidad, entidadId, detalle) {
+  try {
+    await db.query(
+      `INSERT INTO auditoria (empresa_id, usuario_id, rol, accion, entidad, entidad_id, detalle) VALUES (?,?,?,?,?,?,?)`,
+      [req.user.empresa_id, req.user.id, req.user.rol, accion, entidad, entidadId || null,
+       typeof detalle === 'string' ? detalle : JSON.stringify(detalle || {})]);
+  } catch (e) { console.error('audit:', e.message); }
+}
+async function notificar(db, empresaId, { rol = null, usuario_id = null, tipo, titulo, detalle = '', ref_tipo = '', ref_id = null }) {
+  try {
+    await db.query(
+      `INSERT INTO notificaciones (empresa_id, rol, usuario_id, tipo, titulo, detalle, ref_tipo, ref_id) VALUES (?,?,?,?,?,?,?,?)`,
+      [empresaId, rol, usuario_id, tipo, String(titulo).slice(0, 120), String(detalle).slice(0, 250), ref_tipo, ref_id]);
+  } catch (e) { console.error('notificar:', e.message); }
+}
+
+// Envoltorio transaccional: commit/rollback y respuesta JSON
+async function conTransaccion(fn, res) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const out = await fn(conn);
+    await conn.commit();
+    res.json({ ok: true, ...(out || {}) });
+  } catch (e) {
+    await conn.rollback();
+    res.status(400).json({ ok: false, error: e.message });
+  } finally { conn.release(); }
+}
+
+// ── Stock ────────────────────────────────────────────────────
+async function moverStock(conn, { empresaId, productoId, almacenId, delta, tipo, motivo, usuarioId, docId = null, ventaId = null }) {
   await conn.query(
     `INSERT INTO stock_almacen (empresa_id, producto_id, almacen_id, stock) VALUES (?,?,?,0)
      ON DUPLICATE KEY UPDATE stock = stock`, [empresaId, productoId, almacenId]);
@@ -131,15 +170,22 @@ async function moverStock(conn, { empresaId, productoId, almacenId, delta, tipo,
   if (Number(fila.stock) + delta < 0) throw new Error('Stock insuficiente en el almacén seleccionado');
   await conn.query(`UPDATE stock_almacen SET stock = stock + ? WHERE producto_id=? AND almacen_id=?`, [delta, productoId, almacenId]);
   await conn.query(`UPDATE productos SET stock = stock + ? WHERE id=? AND empresa_id=?`, [delta, productoId, empresaId]);
-  const [[p]] = await conn.query(`SELECT stock FROM productos WHERE id=?`, [productoId]);
+  const [[p]] = await conn.query(`SELECT nombre, stock, stock_minimo FROM productos WHERE id=?`, [productoId]);
   await conn.query(
-    `INSERT INTO movimientos_stock (empresa_id, producto_id, almacen_id, tipo, cantidad, saldo, motivo, documento_id, usuario_id)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
-    [empresaId, productoId, almacenId, tipo, delta, p.stock, motivo || '', docId, usuarioId]);
+    `INSERT INTO movimientos_stock (empresa_id, producto_id, almacen_id, tipo, cantidad, saldo, motivo, documento_id, venta_id, usuario_id)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    [empresaId, productoId, almacenId, tipo, delta, p.stock, motivo || '', docId, ventaId, usuarioId]);
+  // Aviso al propietario solo al cruzar el mínimo
+  const antes = Number(p.stock) - delta, min = Number(p.stock_minimo);
+  if (delta < 0 && antes > min && Number(p.stock) <= min) {
+    await notificar(conn, empresaId, {
+      rol: 'propietario', tipo: 'stock_bajo',
+      titulo: Number(p.stock) <= 0 ? 'Producto agotado' : 'Stock bajo',
+      detalle: `${p.nombre}: quedan ${p.stock} (mínimo ${min})`, ref_tipo: 'producto', ref_id: productoId });
+  }
 }
 
-// Las ventas descuentan primero del almacén principal y luego de los demás
-async function descontarVenta(conn, empresaId, productoId, cantidad, usuarioId) {
+async function descontarVenta(conn, empresaId, productoId, cantidad, usuarioId, ventaId = null) {
   let falta = Number(cantidad);
   const [filas] = await conn.query(
     `SELECT sa.almacen_id, sa.stock FROM stock_almacen sa JOIN almacenes a ON a.id = sa.almacen_id
@@ -148,10 +194,28 @@ async function descontarVenta(conn, empresaId, productoId, cantidad, usuarioId) 
   for (const f of filas) {
     if (falta <= 0) break;
     const tomar = Math.min(falta, Number(f.stock));
-    await moverStock(conn, { empresaId, productoId, almacenId: f.almacen_id, delta: -tomar, tipo: 'venta', motivo: 'Venta', usuarioId });
+    await moverStock(conn, { empresaId, productoId, almacenId: f.almacen_id, delta: -tomar, tipo: 'venta', motivo: 'Venta', usuarioId, ventaId });
     falta -= tomar;
   }
   if (falta > 0) throw new Error('Stock insuficiente para completar la venta');
+}
+
+// Movimiento inverso auditable: devuelve al mismo almacén de donde salió
+async function reponerVenta(conn, v, usuarioId) {
+  const motivo = `Anulación ${numVenta(v.numero)}`;
+  const [movs] = await conn.query(
+    `SELECT producto_id, almacen_id, SUM(-cantidad) AS cant FROM movimientos_stock
+     WHERE venta_id=? AND empresa_id=? AND tipo='venta' GROUP BY producto_id, almacen_id`, [v.id, v.empresa_id]);
+  if (movs.length) {
+    for (const m of movs) if (Number(m.cant) > 0)
+      await moverStock(conn, { empresaId: v.empresa_id, productoId: m.producto_id, almacenId: m.almacen_id,
+        delta: Number(m.cant), tipo: 'anulacion', motivo, usuarioId, ventaId: v.id });
+  } else { // ventas anteriores a la migración: vuelve al almacén principal
+    const alm = await almacenPrincipal(conn, v.empresa_id);
+    for (const it of parseItems(v.items_json)) if (it.producto_id)
+      await moverStock(conn, { empresaId: v.empresa_id, productoId: it.producto_id, almacenId: alm,
+        delta: Number(it.cantidad) || 1, tipo: 'anulacion', motivo, usuarioId, ventaId: v.id });
+  }
 }
 
 function datosProducto(b) {
@@ -448,15 +512,24 @@ app.get('/api/atenciones', verificarToken, requireEmpresa, ah(async (req, res) =
 
 app.post('/api/atenciones', verificarToken, requireEmpresa, ah(async (req, res) => {
   const { paciente_id, cliente_id, cita_id, origen, prioridad, veterinario_id } = req.body || {};
+  const eid = req.user.empresa_id;
   if (!paciente_id || !cliente_id) return res.status(400).json({ ok: false, error: 'Paciente y cliente son obligatorios' });
-  // Si la crea un veterinario, queda asignada a él automáticamente
-  const vetId = req.user.rol === 'veterinario' ? req.user.id : await vetValido(veterinario_id, req.user.empresa_id);
+  const vetId = req.user.rol === 'veterinario' ? req.user.id : await vetValido(veterinario_id, eid);
   if (vetId === false) return res.status(400).json({ ok: false, error: 'Veterinario no válido' });
   const [result] = await pool.query(
     `INSERT INTO atenciones (empresa_id, staff_id, veterinario_id, paciente_id, cliente_id, cita_id, origen, prioridad, estado)
      VALUES (?,?,?,?,?,?,?,?, 'llegada')`,
-    [req.user.empresa_id, req.user.id, vetId, paciente_id, cliente_id, cita_id || null, origen || 'sin_cita', prioridad || 'normal']
-  );
+    [eid, req.user.id, vetId, paciente_id, cliente_id, cita_id || null, origen || 'sin_cita', prioridad || 'normal']);
+  if (cita_id) await pool.query(
+    `UPDATE citas SET estado='en_espera' WHERE id=? AND empresa_id=? AND estado IN ('pendiente','confirmada')`, [cita_id, eid]);
+  if (req.user.rol !== 'veterinario') {
+    const [[pa]] = await pool.query('SELECT nombre FROM pacientes WHERE id=? AND empresa_id=?', [paciente_id, eid]);
+    const urg = ['urgente', 'emergencia'].includes(prioridad);
+    await notificar(pool, eid, {
+      ...(vetId ? { usuario_id: vetId } : { rol: 'veterinario' }), tipo: 'paciente_espera',
+      titulo: urg ? '🚨 Paciente urgente en sala' : 'Nuevo paciente en sala de espera',
+      detalle: pa?.nombre || '', ref_tipo: 'atencion', ref_id: result.insertId });
+  }
   res.json({ ok: true, id: result.insertId });
 }));
 
@@ -471,15 +544,22 @@ app.put('/api/atenciones/:id/asignar', verificarToken, requireRoles('propietario
 // Recepción no puede pasar la atención a las etapas clínicas (consulta, diagnóstico, tratamiento)
 app.put('/api/atenciones/:id/estado', verificarToken, requireEmpresa, ah(async (req, res) => {
   const { estado } = req.body || {};
-  const estadosValidos = ['llegada','triaje','espera','consulta','diagnostico','tratamiento','venta','seguimiento','cerrada'];
-  if (!estadosValidos.includes(estado)) return res.status(400).json({ ok: false, error: 'Estado inválido' });
-  if (req.user.rol === 'recepcion' && ['consulta','diagnostico','tratamiento'].includes(estado)) {
+  const eid = req.user.empresa_id;
+  const validos = ['llegada','triaje','espera','llamado','consulta','diagnostico','tratamiento','venta','seguimiento','cerrada'];
+  if (!validos.includes(estado)) return res.status(400).json({ ok: false, error: 'Estado inválido' });
+  if (req.user.rol === 'recepcion' && ['llamado','consulta','diagnostico','tratamiento'].includes(estado))
     return res.status(403).json({ ok: false, error: 'Recepción no puede pasar la atención a etapas clínicas' });
-  }
-  const params = [estado, req.params.id, req.user.empresa_id];
-  let filtro = '';
+  const params = [estado, req.params.id, eid]; let filtro = '';
   if (req.user.rol === 'veterinario') { filtro = ' AND veterinario_id=?'; params.push(req.user.id); }
-  await pool.query(`UPDATE atenciones SET estado=? WHERE id=? AND empresa_id=?${filtro}`, params);
+  const [r] = await pool.query(`UPDATE atenciones SET estado=? WHERE id=? AND empresa_id=?${filtro}`, params);
+  if (r.affectedRows && ['llamado', 'venta'].includes(estado)) {
+    const [[a]] = await pool.query(
+      `SELECT pa.nombre FROM atenciones a JOIN pacientes pa ON pa.id=a.paciente_id WHERE a.id=? AND a.empresa_id=?`, [req.params.id, eid]);
+    await notificar(pool, eid, { rol: 'recepcion',
+      tipo: estado === 'llamado' ? 'paciente_llamado' : 'consulta_finalizada',
+      titulo: estado === 'llamado' ? 'El veterinario solicita al paciente' : 'Consulta finalizada: preparar cobro',
+      detalle: a?.nombre || '', ref_tipo: 'atencion', ref_id: Number(req.params.id) });
+  }
   res.json({ ok: true });
 }));
 
@@ -889,72 +969,178 @@ app.post('/api/stock-documentos', verificarToken, requireRoles('propietario', 'r
 });
 
 // ══════════════════════════════════════════════════════════════
-// VENTAS / COBROS — los 3 roles crean y consultan; borrar: propietario y recepción
+// VENTAS / PAGOS — un solo motor, dos modalidades (consulta / individual)
+// Estados: borrador · pendiente · parcial · pagado · anulado · reembolsado
 // ══════════════════════════════════════════════════════════════
-app.get('/api/ventas', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
+const rolesVenta = requireRoles('propietario', 'recepcion', 'veterinario');
+
+app.get('/api/ventas', verificarToken, rolesVenta, ah(async (req, res) => {
+  const p = [req.user.empresa_id]; let f = '';
+  if (['consulta', 'individual'].includes(req.query.tipo)) { f += ' AND v.tipo=?'; p.push(req.query.tipo); }
+  if (req.query.estado === 'pendientes') f += " AND v.estado_pago IN ('pendiente','parcial')";
+  else if (req.query.estado) { f += ' AND v.estado_pago=?'; p.push(req.query.estado); }
   const [rows] = await pool.query(
-    `SELECT v.*, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre, vet.nombre AS veterinario_nombre
+    `SELECT v.*, (v.total - v.pagado) AS saldo, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre,
+            vet.nombre AS veterinario_nombre, us.nombre AS usuario_nombre
      FROM ventas v
      LEFT JOIN clientes c ON c.id = v.cliente_id
      LEFT JOIN pacientes pa ON pa.id = v.paciente_id
      LEFT JOIN usuarios vet ON vet.id = v.veterinario_id
-     WHERE v.empresa_id=? ORDER BY v.id DESC`, [req.user.empresa_id]
-  );
+     LEFT JOIN usuarios us ON us.id = v.usuario_id
+     WHERE v.empresa_id=?${f} ORDER BY v.id DESC`, p);
   res.json({ ok: true, ventas: rows });
 }));
 
+app.get('/api/ventas/:id/pagos', verificarToken, rolesVenta, ah(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT p.*, u.nombre AS usuario_nombre FROM pagos p LEFT JOIN usuarios u ON u.id=p.usuario_id
+     WHERE p.venta_id=? AND p.empresa_id=? ORDER BY p.id`, [req.params.id, req.user.empresa_id]);
+  res.json({ ok: true, pagos: rows });
+}));
 
-app.post('/api/ventas', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), async (req, res) => {
-  const conn = await pool.getConnection();
-  try {
-    const { cliente_id, paciente_id, historia_id, items, descuento, metodo_pago, estado_pago,
-            referencia, tipo_tarjeta, recibido, cambio } = req.body || {};
-    if (!Array.isArray(items) || !items.length) return res.status(400).json({ ok: false, error: 'Agrega al menos un producto o servicio' });
-    const eid = req.user.empresa_id;
+// Registra un pago/abono (usa la fila bloqueada de la venta)
+async function registrarPagoDB(conn, req, ventaId, b) {
+  const [[v]] = await conn.query('SELECT * FROM ventas WHERE id=? AND empresa_id=? FOR UPDATE', [ventaId, req.user.empresa_id]);
+  if (!v) throw new Error('Venta no encontrada');
+  if (!['pendiente', 'parcial'].includes(v.estado_pago)) throw new Error(`No se puede cobrar una venta en estado "${v.estado_pago}"`);
+  const saldo = r2(Number(v.total) - Number(v.pagado));
+  const monto = r2(b.monto === undefined || b.monto === null || b.monto === '' ? saldo : b.monto);
+  if (!(monto > 0)) throw new Error('Monto inválido');
+  if (monto > saldo + 0.001) throw new Error(`El monto supera el saldo pendiente (${saldo.toFixed(2)})`);
+  const metodo = METODOS.includes(b.metodo) ? b.metodo : 'efectivo';
+  const recibido = b.recibido === undefined || b.recibido === null || b.recibido === '' ? null : r2(b.recibido);
+  if (metodo === 'efectivo' && recibido !== null && recibido < monto) throw new Error('El dinero recibido es menor al monto');
+  const cambio = metodo === 'efectivo' && recibido !== null ? r2(recibido - monto) : null;
+  await conn.query(
+    `INSERT INTO pagos (empresa_id, venta_id, monto, metodo, referencia, tipo_tarjeta, recibido, cambio, usuario_id) VALUES (?,?,?,?,?,?,?,?,?)`,
+    [req.user.empresa_id, v.id, monto, metodo, b.referencia || '', b.tipo_tarjeta || '', recibido, cambio, req.user.id]);
+  const pagado = r2(Number(v.pagado) + monto);
+  const estado = pagado >= Number(v.total) - 0.001 ? 'pagado' : 'parcial';
+  await conn.query('UPDATE ventas SET pagado=?, estado_pago=?, metodo_pago=? WHERE id=?', [pagado, estado, metodo, v.id]);
+  await audit(conn, req, 'pago', 'venta', v.id, { monto, metodo, estado });
+  return { estado, saldo: r2(Number(v.total) - pagado), numero: v.numero };
+}
 
-    await conn.beginTransaction();
-    if (historia_id) {
-      const [dup] = await conn.query('SELECT id FROM ventas WHERE historia_id=? AND empresa_id=?', [historia_id, eid]);
-      if (dup.length) throw new Error('Esta consulta ya tiene una venta registrada');
-    }
-
-    let subtotal = 0; const lineas = [];
-    for (const item of items) {
-      const cant = Math.max(1, parseInt(item.cantidad) || 1);
-      let nombre = item.nombre, precio = Number(item.precio) || 0;
-      if (item.producto_id) {
-        const [[p]] = await conn.query('SELECT nombre, precio_venta FROM productos WHERE id=? AND empresa_id=?', [item.producto_id, eid]);
-        if (!p) throw new Error('Producto no encontrado');
-        nombre = p.nombre; precio = Number(p.precio_venta);
-        await descontarVenta(conn, eid, item.producto_id, cant, req.user.id);
-      }
-      subtotal += precio * cant;
-      lineas.push({ producto_id: item.producto_id || null, nombre, precio, cantidad: cant });
-    }
-    const total = Math.max(subtotal - Number(descuento || 0), 0);
-    const estado = estado_pago === 'pendiente' ? 'pendiente' : 'pagado';
-    const [[{ n }]] = await conn.query('SELECT COALESCE(MAX(numero),0)+1 AS n FROM ventas WHERE empresa_id=?', [eid]);
-
-    const [result] = await conn.query(
-      `INSERT INTO ventas (empresa_id, numero, cliente_id, paciente_id, historia_id, veterinario_id, items_json, subtotal, descuento, total,
-                           metodo_pago, estado_pago, referencia, tipo_tarjeta, recibido, cambio)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [eid, n, cliente_id || null, paciente_id || null, historia_id || null,
-       req.user.rol === 'veterinario' ? req.user.id : null, JSON.stringify(lineas),
-       subtotal, descuento || 0, total, metodo_pago || 'efectivo', estado,
-       referencia || '', tipo_tarjeta || '', recibido ?? null, cambio ?? null]
-    );
-    await conn.commit();
-    res.json({ ok: true, id: result.insertId, numero: n, total });
-  } catch (e) {
-    await conn.rollback();
-    res.status(400).json({ ok: false, error: e.message });
-  } finally {
-    conn.release();
+app.post('/api/ventas', verificarToken, rolesVenta, (req, res) => conTransaccion(async (conn) => {
+  const b = req.body || {}, eid = req.user.empresa_id;
+  if (!Array.isArray(b.items) || !b.items.length) throw new Error('Agrega al menos un producto o servicio');
+  if (b.historia_id) {
+    const [dup] = await conn.query(
+      `SELECT id FROM ventas WHERE historia_id=? AND empresa_id=? AND estado_pago NOT IN ('anulado','reembolsado')`, [b.historia_id, eid]);
+    if (dup.length) throw new Error('Esta consulta ya tiene una venta registrada');
   }
-});
+  let subtotal = 0; const lineas = [];
+  for (const item of b.items) {
+    const cant = Math.max(1, parseInt(item.cantidad) || 1);
+    let nombre = String(item.nombre || '').trim(), precio = Number(item.precio) || 0;
+    if (item.producto_id) {
+      const [[p]] = await conn.query('SELECT nombre, precio_venta FROM productos WHERE id=? AND empresa_id=?', [item.producto_id, eid]);
+      if (!p) throw new Error('Producto no encontrado');
+      nombre = p.nombre; precio = Number(p.precio_venta);
+    }
+    if (!nombre || precio < 0) throw new Error('Ítem inválido');
+    subtotal += precio * cant;
+    lineas.push({ producto_id: item.producto_id || null, nombre, precio, cantidad: cant });
+  }
+  subtotal = r2(subtotal);
+  const desc = r2(Math.max(0, Number(b.descuento) || 0));
+  if (desc > subtotal) throw new Error('El descuento no puede superar el subtotal');
+  if (req.user.rol !== 'propietario' && desc > subtotal * DESC_MAX_PCT / 100 + 0.001)
+    throw new Error(`Descuentos mayores al ${DESC_MAX_PCT}% los autoriza el propietario`);
+  const impuesto = r2((subtotal - desc) * IVA_PCT / 100);
+  const total = r2(subtotal - desc + impuesto);
+  const tipo = b.historia_id ? 'consulta' : 'individual';
+  const borrador = !!b.borrador;
+  const estadoIni = borrador ? 'borrador' : total === 0 ? 'pagado' : 'pendiente';
+  const [[{ n }]] = await conn.query('SELECT COALESCE(MAX(numero),0)+1 AS n FROM ventas WHERE empresa_id=?', [eid]);
+  const [ins] = await conn.query(
+    `INSERT INTO ventas (empresa_id, numero, tipo, cliente_id, paciente_id, historia_id, veterinario_id, usuario_id, items_json,
+                         subtotal, descuento, impuesto, total, pagado, metodo_pago, estado_pago)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`,
+    [eid, n, tipo, b.cliente_id || null, b.paciente_id || null, b.historia_id || null,
+     req.user.rol === 'veterinario' ? req.user.id : null, req.user.id, JSON.stringify(lineas),
+     subtotal, desc, impuesto, total, METODOS.includes(b.metodo_pago) ? b.metodo_pago : 'efectivo', estadoIni]);
+  const id = ins.insertId;
 
-app.post('/api/ventas/:id/comprobante', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), upload.single('comprobante'), ah(async (req, res) => {
+  // El borrador no toca inventario hasta confirmarse
+  if (!borrador) for (const l of lineas) if (l.producto_id) await descontarVenta(conn, eid, l.producto_id, l.cantidad, req.user.id, id);
+
+  let estado = estadoIni;
+  if (!borrador && total > 0) {
+    const monto = b.estado_pago === 'pagado' ? total : Math.min(r2(b.abono), total);
+    if (monto > 0) {
+      const r = await registrarPagoDB(conn, req, id, { monto, metodo: b.metodo_pago, referencia: b.referencia,
+        tipo_tarjeta: b.tipo_tarjeta, recibido: b.recibido });
+      estado = r.estado;
+    }
+  }
+  await audit(conn, req, 'crear', 'venta', id, { numero: n, tipo, total, estado });
+
+  if (tipo === 'consulta' && !borrador && estado !== 'pagado') {
+    let pac = '';
+    if (b.paciente_id) { const [[pa]] = await conn.query('SELECT nombre FROM pacientes WHERE id=?', [b.paciente_id]); pac = pa?.nombre || ''; }
+    await notificar(conn, eid, { rol: 'recepcion', tipo: 'receta_pendiente', titulo: 'Receta pendiente de cobro',
+      detalle: `${numVenta(n)} · ${pac || 'Paciente'} · ${fmtUSD(total)}`, ref_tipo: 'venta', ref_id: id });
+  }
+  return { id, numero: n, total, estado };
+}, res));
+const fmtUSD = (n) => '$' + Number(n || 0).toFixed(2);
+
+// Confirma un borrador: recién ahí descuenta inventario
+app.put('/api/ventas/:id/confirmar', verificarToken, rolesVenta, (req, res) => conTransaccion(async (conn) => {
+  const [[v]] = await conn.query('SELECT * FROM ventas WHERE id=? AND empresa_id=? FOR UPDATE', [req.params.id, req.user.empresa_id]);
+  if (!v) throw new Error('Venta no encontrada');
+  if (v.estado_pago !== 'borrador') throw new Error('Solo se confirman borradores');
+  for (const l of parseItems(v.items_json)) if (l.producto_id)
+    await descontarVenta(conn, v.empresa_id, l.producto_id, l.cantidad, req.user.id, v.id);
+  await conn.query(`UPDATE ventas SET estado_pago='pendiente' WHERE id=?`, [v.id]);
+  await audit(conn, req, 'confirmar', 'venta', v.id, {});
+  return { estado: 'pendiente' };
+}, res));
+
+// Pago / abono (varios por venta)
+app.post('/api/ventas/:id/pagos', verificarToken, rolesVenta, (req, res) => conTransaccion(async (conn) => {
+  const b = req.body || {};
+  if (b.metodo === 'transferencia' && !String(b.referencia || '').trim() && !b.con_comprobante)
+    throw new Error('Ingresa la referencia o adjunta el comprobante');
+  return registrarPagoDB(conn, req, req.params.id, b);
+}, res));
+
+// Compatibilidad con los botones antiguos "Cobrar / Registrar pago": paga el saldo completo
+app.put('/api/ventas/:id/pago', verificarToken, rolesVenta, (req, res) => conTransaccion(
+  (conn) => registrarPagoDB(conn, req, req.params.id, { metodo: (req.body || {}).metodo_pago }), res));
+
+// Anulación con reversión de stock y reembolso auditable. Reemplaza al DELETE físico.
+app.put('/api/ventas/:id/anular', verificarToken, requireRoles('propietario', 'recepcion'), (req, res) => conTransaccion(async (conn) => {
+  const motivo = String((req.body || {}).motivo || '').trim();
+  if (motivo.length < 3) throw new Error('El motivo de la anulación es obligatorio');
+  const [[v]] = await conn.query('SELECT * FROM ventas WHERE id=? AND empresa_id=? FOR UPDATE', [req.params.id, req.user.empresa_id]);
+  if (!v) throw new Error('Venta no encontrada');
+  if (['anulado', 'reembolsado'].includes(v.estado_pago)) throw new Error('La venta ya está anulada');
+  if (req.user.rol !== 'propietario' && Number(v.pagado) > 0) throw new Error('Una venta con pagos solo puede anularla el propietario');
+  if (v.estado_pago !== 'borrador') await reponerVenta(conn, v, req.user.id);
+  let estado = 'anulado';
+  if (Number(v.pagado) > 0) {
+    const [porMetodo] = await conn.query(
+      `SELECT metodo, SUM(monto) AS m FROM pagos WHERE venta_id=? GROUP BY metodo HAVING m>0`, [v.id]);
+    for (const m of porMetodo)
+      await conn.query(
+        `INSERT INTO pagos (empresa_id, venta_id, monto, metodo, referencia, usuario_id) VALUES (?,?,?,?,?,?)`,
+        [v.empresa_id, v.id, -Number(m.m), m.metodo, ('Reembolso: ' + motivo).slice(0, 160), req.user.id]);
+    estado = 'reembolsado';
+  }
+  await conn.query(
+    `UPDATE ventas SET estado_pago=?, anulada_por=?, anulada_at=NOW(), motivo_anulacion=? WHERE id=?`,
+    [estado, req.user.id, motivo.slice(0, 255), v.id]);
+  await audit(conn, req, 'anular', 'venta', v.id, { estado, motivo, pagado: v.pagado });
+  return { estado };
+}, res));
+
+// Las ventas nunca se borran
+app.delete('/api/ventas/:id', verificarToken, requireEmpresa, (req, res) =>
+  res.status(405).json({ ok: false, error: 'Las ventas no se eliminan: usa "Anular"' }));
+
+app.post('/api/ventas/:id/comprobante', verificarToken, rolesVenta, upload.single('comprobante'), ah(async (req, res) => {
   if (!req.file) return res.status(400).json({ ok: false, error: 'No se recibió la imagen' });
   const [r] = await pool.query('SELECT id FROM ventas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
   if (!r.length) return res.status(404).json({ ok: false, error: 'Venta no encontrada' });
@@ -962,68 +1148,50 @@ app.post('/api/ventas/:id/comprobante', verificarToken, requireRoles('propietari
   await pool.query('UPDATE ventas SET comprobante_url=? WHERE id=?', [up.secure_url, req.params.id]);
   res.json({ ok: true, comprobante_url: up.secure_url });
 }));
-
-// Precios de servicios (Configuración): todos leen, solo propietario edita
-app.get('/api/servicios', verificarToken, requireEmpresa, ah(async (req, res) => {
-  const [rows] = await pool.query('SELECT nombre, precio FROM servicios WHERE empresa_id=? ORDER BY nombre', [req.user.empresa_id]);
-  res.json({ ok: true, servicios: rows });
-}));
-app.put('/api/servicios', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
-  const { nombre, precio } = req.body || {};
-  if (!nombre) return res.status(400).json({ ok: false, error: 'Nombre obligatorio' });
-  await pool.query(
-    'INSERT INTO servicios (empresa_id, nombre, precio) VALUES (?,?,?) ON DUPLICATE KEY UPDATE precio=VALUES(precio)',
-    [req.user.empresa_id, nombre, Number(precio) || 0]);
-  res.json({ ok: true });
-}));
-
-// "Registrar pago" de una venta que quedó pendiente
-app.put('/api/ventas/:id/pago', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
-  const metodo = (req.body || {}).metodo_pago;
-  await pool.query(
-    `UPDATE ventas SET estado_pago='pagado', metodo_pago=COALESCE(?, metodo_pago) WHERE id=? AND empresa_id=?`,
-    [metodo || null, req.params.id, req.user.empresa_id]
-  );
-  res.json({ ok: true });
-}));
-
-app.delete('/api/ventas/:id', verificarToken, requireRoles('propietario', 'recepcion'), ah(async (req, res) => {
-  await pool.query('DELETE FROM ventas WHERE id=? AND empresa_id=?', [req.params.id, req.user.empresa_id]);
-  res.json({ ok: true });
-}));
-
 // ══════════════════════════════════════════════════════════════
 // FINANZAS / CAJA — propietario ve el rango completo; veterinario y recepción, solo hoy y totales
 // ══════════════════════════════════════════════════════════════
+
 app.get('/api/caja', verificarToken, requireEmpresa, ah(async (req, res) => {
   const { desde, hasta, limitado } = await resolverRango(req);
   const eid = req.user.empresa_id;
-  const base = `FROM ventas WHERE empresa_id=? AND DATE(created_at) BETWEEN ? AND ?`;
   const [porMetodo] = await pool.query(
-    `SELECT metodo_pago AS metodo, COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total ${base} AND estado_pago='pagado' GROUP BY metodo_pago`,
-    [eid, desde, hasta]
-  );
+    `SELECT metodo, SUM(monto>0) AS cantidad, COALESCE(SUM(monto),0) AS total
+     FROM pagos WHERE empresa_id=? AND DATE(created_at) BETWEEN ? AND ? GROUP BY metodo`, [eid, desde, hasta]);
   const [[pendiente]] = await pool.query(
-    `SELECT COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total ${base} AND estado_pago<>'pagado'`,
-    [eid, desde, hasta]
-  );
+    `SELECT COUNT(*) AS cantidad, COALESCE(SUM(total-pagado),0) AS total FROM ventas
+     WHERE empresa_id=? AND estado_pago IN ('pendiente','parcial')`, [eid]);
   let porDia = [];
-  if (!limitado) {
-    [porDia] = await pool.query(
-      `SELECT DATE_FORMAT(created_at,'%Y-%m-%d') AS dia, COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total
-       ${base} AND estado_pago='pagado' GROUP BY DATE_FORMAT(created_at,'%Y-%m-%d') ORDER BY dia`,
-      [eid, desde, hasta]
-    );
-  }
+  if (!limitado) [porDia] = await pool.query(
+    `SELECT DATE_FORMAT(created_at,'%Y-%m-%d') AS dia, SUM(monto>0) AS cantidad, COALESCE(SUM(monto),0) AS total
+     FROM pagos WHERE empresa_id=? AND DATE(created_at) BETWEEN ? AND ?
+     GROUP BY DATE_FORMAT(created_at,'%Y-%m-%d') ORDER BY dia`, [eid, desde, hasta]);
   const total = porMetodo.reduce((a, m) => a + Number(m.total || 0), 0);
   const cantidad = porMetodo.reduce((a, m) => a + Number(m.cantidad || 0), 0);
   res.json({ ok: true, desde, hasta, limitado, total, cantidad, porMetodo, pendiente, porDia });
 }));
 
-// ══════════════════════════════════════════════════════════════
-// REPORTES — propietario ve el rango completo con extras; veterinario y recepción, solo hoy
-// (el veterinario solo cuenta lo suyo)
-// ══════════════════════════════════════════════════════════════
+app.get('/api/resumen', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
+  const eid = req.user.empresa_id;
+  const NV = "estado_pago NOT IN ('anulado','reembolsado','borrador')";
+  const [[{ totalClientes }]] = await pool.query('SELECT COUNT(*) AS totalClientes FROM clientes WHERE empresa_id=?', [eid]);
+  const [[{ totalPacientes }]] = await pool.query('SELECT COUNT(*) AS totalPacientes FROM pacientes WHERE empresa_id=?', [eid]);
+  const [[{ citasHoy }]] = await pool.query('SELECT COUNT(*) AS citasHoy FROM citas WHERE empresa_id=? AND fecha=CURDATE()', [eid]);
+  const [[{ enEspera }]] = await pool.query(`SELECT COUNT(*) AS enEspera FROM atenciones WHERE empresa_id=? AND estado IN ('llegada','triaje','espera')`, [eid]);
+  const [[{ ventasMes }]] = await pool.query(
+    `SELECT COALESCE(SUM(total),0) AS ventasMes FROM ventas WHERE empresa_id=? AND ${NV} AND MONTH(created_at)=MONTH(CURDATE()) AND YEAR(created_at)=YEAR(CURDATE())`, [eid]);
+  const [[{ ventasHoy }]] = await pool.query(`SELECT COALESCE(SUM(total),0) AS ventasHoy FROM ventas WHERE empresa_id=? AND ${NV} AND DATE(created_at)=CURDATE()`, [eid]);
+  const [[{ stockBajo }]] = await pool.query('SELECT COUNT(*) AS stockBajo FROM productos WHERE empresa_id=? AND stock <= stock_minimo', [eid]);
+  const [proximasCitas] = await pool.query(
+    `SELECT ci.*, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre
+     FROM citas ci LEFT JOIN clientes c ON c.id=ci.cliente_id LEFT JOIN pacientes pa ON pa.id=ci.paciente_id
+     WHERE ci.empresa_id=? AND ci.fecha=CURDATE() AND ci.estado NOT IN ('cancelada','atendida')
+     ORDER BY ci.hora ASC LIMIT 6`, [eid]);
+  const alertas = Number(stockBajo);
+  res.json({ ok: true, totalClientes, totalPacientes, citasHoy, enEspera, ventasMes, ventasHoy, stockBajo, alertas, proximasCitas });
+}));
+
+
 app.get('/api/reportes', verificarToken, requireEmpresa, ah(async (req, res) => {
   const { desde, hasta, limitado } = await resolverRango(req);
   const eid = req.user.empresa_id;
@@ -1052,8 +1220,11 @@ app.get('/api/reportes', verificarToken, requireEmpresa, ah(async (req, res) => 
        WHERE a.empresa_id=? AND DATE(a.created_at) BETWEEN ? AND ? GROUP BY a.veterinario_id, v.nombre ORDER BY total DESC`,
       [eid, desde, hasta]
     );
+
+    // (1) ahora incluye pagos parciales
     const [ventas] = await pool.query(
-      `SELECT items_json FROM ventas WHERE empresa_id=? AND DATE(created_at) BETWEEN ? AND ? AND estado_pago='pagado' LIMIT 5000`,
+      `SELECT items_json FROM ventas
+       WHERE empresa_id=? AND DATE(created_at) BETWEEN ? AND ? AND estado_pago IN ('pagado','parcial') LIMIT 5000`,
       [eid, desde, hasta]
     );
     const mapa = {};
@@ -1061,41 +1232,48 @@ app.get('/api/reportes', verificarToken, requireEmpresa, ah(async (req, res) => 
       let items = [];
       try { items = typeof v.items_json === 'string' ? JSON.parse(v.items_json) : (v.items_json || []); } catch (e) { items = []; }
       for (const it of items) {
-        const k = it.nombre || '—';
-        mapa[k] = mapa[k] || { nombre: k, cantidad: 0, total: 0 };
+        // (2) separa productos de servicios
+        const k = (it.producto_id ? 'P|' : 'S|') + (it.nombre || '—');
+        mapa[k] = mapa[k] || { nombre: it.nombre || '—', tipo: it.producto_id ? 'Producto' : 'Servicio', cantidad: 0, total: 0 };
         mapa[k].cantidad += Number(it.cantidad || 1);
         mapa[k].total += Number(it.precio || 0) * Number(it.cantidad || 1);
       }
     }
+
+    // (3) ventas por modalidad
+    const [porTipo] = await pool.query(
+      `SELECT tipo, COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total FROM ventas
+       WHERE empresa_id=? AND DATE(created_at) BETWEEN ? AND ? AND estado_pago NOT IN ('anulado','reembolsado','borrador')
+       GROUP BY tipo`, [eid, desde, hasta]
+    );
+
     out.consultas = Number(consultas || 0);
     out.porVeterinario = porVeterinario;
     out.topProductos = Object.values(mapa).sort((a, b) => b.total - a.total).slice(0, 8);
+    out.porTipo = porTipo;
   }
   res.json(out);
 }));
 
-// ══════════════════════════════════════════════════════════════
-// DASHBOARD RESUMEN — solo propietario (el veterinario y recepción arman su inicio con citas, atenciones y caja)
-// ══════════════════════════════════════════════════════════════
-app.get('/api/resumen', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
+app.get('/api/reportes/ventas', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
   const eid = req.user.empresa_id;
-  const [[{ totalClientes }]] = await pool.query('SELECT COUNT(*) AS totalClientes FROM clientes WHERE empresa_id=?', [eid]);
-  const [[{ totalPacientes }]] = await pool.query('SELECT COUNT(*) AS totalPacientes FROM pacientes WHERE empresa_id=?', [eid]);
-  const [[{ citasHoy }]] = await pool.query('SELECT COUNT(*) AS citasHoy FROM citas WHERE empresa_id=? AND fecha=CURDATE()', [eid]);
-  const [[{ enEspera }]] = await pool.query(`SELECT COUNT(*) AS enEspera FROM atenciones WHERE empresa_id=? AND estado IN ('llegada','triaje','espera')`, [eid]);
-  const [[{ ventasMes }]] = await pool.query(
-    `SELECT COALESCE(SUM(total),0) AS ventasMes FROM ventas WHERE empresa_id=? AND MONTH(created_at)=MONTH(CURDATE()) AND YEAR(created_at)=YEAR(CURDATE())`, [eid]
-  );
-  const [[{ ventasHoy }]] = await pool.query(`SELECT COALESCE(SUM(total),0) AS ventasHoy FROM ventas WHERE empresa_id=? AND DATE(created_at)=CURDATE()`, [eid]);
-  const [[{ stockBajo }]] = await pool.query('SELECT COUNT(*) AS stockBajo FROM productos WHERE empresa_id=? AND stock <= stock_minimo', [eid]);
-  const [proximasCitas] = await pool.query(
-    `SELECT ci.*, c.nombre AS cliente_nombre, pa.nombre AS paciente_nombre
-     FROM citas ci LEFT JOIN clientes c ON c.id=ci.cliente_id LEFT JOIN pacientes pa ON pa.id=ci.paciente_id
-     WHERE ci.empresa_id=? AND ci.fecha=CURDATE() AND ci.estado NOT IN ('cancelada','atendida')
-     ORDER BY ci.hora ASC LIMIT 6`, [eid]
-  );
-  const alertas = Number(stockBajo);
-  res.json({ ok: true, totalClientes, totalPacientes, citasHoy, enEspera, ventasMes, ventasHoy, stockBajo, alertas, proximasCitas });
+  const valida = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+  const [[f]] = await pool.query(`SELECT DATE_FORMAT(CURDATE(),'%Y-%m-%d') AS hoy, DATE_FORMAT(CURDATE(),'%Y-%m-01') AS inicio`);
+  const desde = valida(req.query.desde) ? req.query.desde : f.inicio;
+  const hasta = valida(req.query.hasta) ? req.query.hasta : f.hoy;
+  const p = [eid, desde, hasta]; let fv = '';
+  if (req.user.rol === 'veterinario') { fv = ' AND v.veterinario_id=?'; p.push(req.user.id); }
+  const J = `FROM pagos pg JOIN ventas v ON v.id=pg.venta_id WHERE pg.empresa_id=? AND DATE(pg.created_at) BETWEEN ? AND ?${fv}`;
+  const [porMetodo] = await pool.query(`SELECT pg.metodo, SUM(pg.monto>0) AS cantidad, COALESCE(SUM(pg.monto),0) AS total ${J} GROUP BY pg.metodo`, p);
+  const [porDia] = await pool.query(
+    `SELECT DATE_FORMAT(pg.created_at,'%Y-%m-%d') AS dia, SUM(pg.monto>0) AS cantidad, COALESCE(SUM(pg.monto),0) AS total
+     ${J} GROUP BY DATE_FORMAT(pg.created_at,'%Y-%m-%d') ORDER BY dia DESC`, p);
+  const pv = [eid]; let fp = '';
+  if (req.user.rol === 'veterinario') { fp = ' AND veterinario_id=?'; pv.push(req.user.id); }
+  const [[pendiente]] = await pool.query(
+    `SELECT COUNT(*) AS cantidad, COALESCE(SUM(total-pagado),0) AS total FROM ventas
+     WHERE empresa_id=? AND estado_pago IN ('pendiente','parcial')${fp}`, pv);
+  res.json({ ok: true, desde, hasta, porMetodo, pendiente, porDia });
 }));
 
 
@@ -1384,24 +1562,6 @@ app.get('/api/documentos', verificarToken, requireRoles('propietario', 'veterina
 }));
 
 // Informe de ventas y cobros (el veterinario solo ve las suyas)
-app.get('/api/reportes/ventas', verificarToken, requireRoles('propietario', 'veterinario'), ah(async (req, res) => {
-  const eid = req.user.empresa_id;
-  const valida = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
-  const [[f]] = await pool.query(`SELECT DATE_FORMAT(CURDATE(),'%Y-%m-%d') AS hoy, DATE_FORMAT(CURDATE(),'%Y-%m-01') AS inicio`);
-  const desde = valida(req.query.desde) ? req.query.desde : f.inicio;
-  const hasta = valida(req.query.hasta) ? req.query.hasta : f.hoy;
-  const p = [eid, desde, hasta]; let fv = '';
-  if (req.user.rol === 'veterinario') { fv = ' AND veterinario_id=?'; p.push(req.user.id); }
-  const base = `FROM ventas WHERE empresa_id=? AND DATE(created_at) BETWEEN ? AND ?${fv}`;
-  const [porMetodo] = await pool.query(
-    `SELECT metodo_pago AS metodo, COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total ${base} AND estado_pago='pagado' GROUP BY metodo_pago`, p);
-  const [[pendiente]] = await pool.query(
-    `SELECT COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total ${base} AND estado_pago<>'pagado'`, p);
-  const [porDia] = await pool.query(
-    `SELECT DATE_FORMAT(created_at,'%Y-%m-%d') AS dia, COUNT(*) AS cantidad, COALESCE(SUM(total),0) AS total
-     ${base} AND estado_pago='pagado' GROUP BY DATE_FORMAT(created_at,'%Y-%m-%d') ORDER BY dia DESC`, p);
-  res.json({ ok: true, desde, hasta, porMetodo, pendiente, porDia });
-}));
 
 // Últimos movimientos de inventario (kardex general)
 app.get('/api/reportes/movimientos', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
@@ -1415,7 +1575,42 @@ app.get('/api/reportes/movimientos', verificarToken, requireRoles('propietario',
 }));
 
 
+const sqlNotif = `empresa_id=? AND (usuario_id=? OR (usuario_id IS NULL AND rol=?))`;
+app.get('/api/notificaciones', verificarToken, requireEmpresa, ah(async (req, res) => {
+  const p = [req.user.empresa_id, req.user.id, req.user.rol];
+  const [rows] = await pool.query(`SELECT * FROM notificaciones WHERE ${sqlNotif} ORDER BY id DESC LIMIT 30`, p);
+  const [[{ n }]] = await pool.query(`SELECT COUNT(*) AS n FROM notificaciones WHERE ${sqlNotif} AND leida=0`, p);
+  res.json({ ok: true, notificaciones: rows, sin_leer: n });
+}));
+app.put('/api/notificaciones/leer', verificarToken, requireEmpresa, ah(async (req, res) => {
+  const p = [req.user.empresa_id, req.user.id, req.user.rol]; const b = req.body || {};
+  if (b.todas) await pool.query(`UPDATE notificaciones SET leida=1 WHERE ${sqlNotif}`, p);
+  else await pool.query(`UPDATE notificaciones SET leida=1 WHERE ${sqlNotif} AND id=?`, [...p, b.id]);
+  res.json({ ok: true });
+}));
 
+// El veterinario (o recepción) solicita producto al propietario
+app.post('/api/solicitudes-producto', verificarToken, requireRoles('veterinario', 'recepcion'), ah(async (req, res) => {
+  const { nombre, cantidad, nota } = req.body || {};
+  if (!String(nombre || '').trim()) return res.status(400).json({ ok: false, error: 'Indica el producto' });
+  const [[u]] = await pool.query('SELECT nombre FROM usuarios WHERE id=?', [req.user.id]);
+  await notificar(pool, req.user.empresa_id, { rol: 'propietario', tipo: 'solicitud_producto',
+    titulo: 'Solicitud de producto',
+    detalle: `${String(nombre).trim()} ×${parseInt(cantidad) || 1}${nota ? ' · ' + nota : ''} — ${u?.nombre || req.user.rol}`,
+    ref_tipo: 'producto' });
+  await audit(pool, req, 'solicitar', 'producto', null, { nombre, cantidad, nota });
+  res.json({ ok: true });
+}));
+
+app.get('/api/auditoria', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
+  const p = [req.user.empresa_id]; let f = '';
+  if (req.query.entidad) { f += ' AND a.entidad=?'; p.push(req.query.entidad); }
+  if (req.query.id) { f += ' AND a.entidad_id=?'; p.push(req.query.id); }
+  const [rows] = await pool.query(
+    `SELECT a.*, u.nombre AS usuario_nombre FROM auditoria a LEFT JOIN usuarios u ON u.id=a.usuario_id
+     WHERE a.empresa_id=?${f} ORDER BY a.id DESC LIMIT 200`, p);
+  res.json({ ok: true, registros: rows });
+}));
 
 
 // ── Salud del servicio ───────────────────────────────────────
