@@ -198,6 +198,21 @@ async function descontarVenta(conn, empresaId, productoId, cantidad, usuarioId, 
     falta -= tomar;
   }
   if (falta > 0) throw new Error('Stock insuficiente para completar la venta');
+  await consumirLotes(conn, empresaId, productoId, cantidad);
+}
+
+// Descuenta de los lotes que vencen primero (FEFO). Si el stock es anterior a los lotes, simplemente no hay nada que restar.
+async function consumirLotes(conn, empresaId, productoId, cantidad) {
+  let falta = Number(cantidad);
+  const [ls] = await conn.query(
+    `SELECT id, cantidad FROM lotes WHERE empresa_id=? AND producto_id=? AND cantidad>0
+     ORDER BY (fecha_vencimiento IS NULL), fecha_vencimiento, id FOR UPDATE`, [empresaId, productoId]);
+  for (const l of ls) {
+    if (falta <= 0) break;
+    const t = Math.min(falta, Number(l.cantidad));
+    await conn.query('UPDATE lotes SET cantidad=cantidad-? WHERE id=?', [t, l.id]);
+    falta -= t;
+  }
 }
 
 // Movimiento inverso auditable: devuelve al mismo almacén de donde salió
@@ -516,6 +531,15 @@ app.post('/api/atenciones', verificarToken, requireEmpresa, ah(async (req, res) 
   if (!paciente_id || !cliente_id) return res.status(400).json({ ok: false, error: 'Paciente y cliente son obligatorios' });
   const vetId = req.user.rol === 'veterinario' ? req.user.id : await vetValido(veterinario_id, eid);
   if (vetId === false) return res.status(400).json({ ok: false, error: 'Veterinario no válido' });
+
+  const [dup] = await pool.query(
+    `SELECT id FROM atenciones WHERE empresa_id=? AND paciente_id=? AND estado!='cerrada' LIMIT 1`, [eid, paciente_id]);
+  if (dup.length) return res.status(409).json({ ok: false, error: 'Este paciente ya tiene una atención activa' });
+  const [[chk]] = await pool.query(
+    `SELECT (SELECT COUNT(*) FROM pacientes WHERE id=? AND empresa_id=?) AS p, (SELECT COUNT(*) FROM clientes WHERE id=? AND empresa_id=?) AS c`,
+    [paciente_id, eid, cliente_id, eid]);
+  if (!chk.p || !chk.c) return res.status(400).json({ ok: false, error: 'Paciente o cliente no válido' });
+
   const [result] = await pool.query(
     `INSERT INTO atenciones (empresa_id, staff_id, veterinario_id, paciente_id, cliente_id, cita_id, origen, prioridad, estado)
      VALUES (?,?,?,?,?,?,?,?, 'llegada')`,
@@ -1169,6 +1193,98 @@ app.get('/api/caja', verificarToken, requireEmpresa, ah(async (req, res) => {
   const total = porMetodo.reduce((a, m) => a + Number(m.total || 0), 0);
   const cantidad = porMetodo.reduce((a, m) => a + Number(m.cantidad || 0), 0);
   res.json({ ok: true, desde, hasta, limitado, total, cantidad, porMetodo, pendiente, porDia });
+}));
+
+// ── TURNOS DE CAJA y EGRESOS (propietario) ───────────────────
+const cajaRol = requireRoles('propietario');
+const CAT_EGRESO = ['compras', 'sueldos', 'servicios', 'operativo', 'otros'];
+
+async function estadoTurno(db, t) {
+  const [[c]] = await db.query(
+    `SELECT COALESCE(SUM(monto),0) AS cobrado FROM pagos WHERE empresa_id=? AND metodo='efectivo' AND created_at>=?`,
+    [t.empresa_id, t.apertura_at]);
+  const [[e]] = await db.query(
+    `SELECT COALESCE(SUM(monto),0) AS egresos FROM egresos WHERE turno_id=? AND metodo='efectivo' AND anulado=0`, [t.id]);
+  const esperado = r2(Number(t.saldo_inicial) + Number(c.cobrado) - Number(e.egresos));
+  return { cobrado_efectivo: r2(c.cobrado), egresos_efectivo: r2(e.egresos), esperado };
+}
+
+app.get('/api/caja/turno', verificarToken, cajaRol, ah(async (req, res) => {
+  const [r] = await pool.query(`SELECT * FROM caja_turnos WHERE empresa_id=? AND estado='abierta' LIMIT 1`, [req.user.empresa_id]);
+  const [hist] = await pool.query(
+    `SELECT * FROM caja_turnos WHERE empresa_id=? AND estado='cerrada' ORDER BY id DESC LIMIT 10`, [req.user.empresa_id]);
+  res.json({ ok: true, turno: r[0] || null, calculo: r[0] ? await estadoTurno(pool, r[0]) : null, historial: hist });
+}));
+
+app.post('/api/caja/abrir', verificarToken, cajaRol, (req, res) => conTransaccion(async (conn) => {
+  const eid = req.user.empresa_id;
+  const [ab] = await conn.query(`SELECT id FROM caja_turnos WHERE empresa_id=? AND estado='abierta' FOR UPDATE`, [eid]);
+  if (ab.length) throw new Error('Ya hay una caja abierta');
+  const saldo = r2((req.body || {}).saldo_inicial);
+  if (saldo < 0) throw new Error('Saldo inicial inválido');
+  const [ins] = await conn.query(`INSERT INTO caja_turnos (empresa_id, usuario_id, saldo_inicial) VALUES (?,?,?)`, [eid, req.user.id, saldo]);
+  await audit(conn, req, 'abrir', 'caja', ins.insertId, { saldo });
+  return { id: ins.insertId };
+}, res));
+
+app.post('/api/caja/cerrar', verificarToken, cajaRol, (req, res) => conTransaccion(async (conn) => {
+  const eid = req.user.empresa_id, b = req.body || {};
+  const [[t]] = await conn.query(`SELECT * FROM caja_turnos WHERE empresa_id=? AND estado='abierta' FOR UPDATE`, [eid]);
+  if (!t) throw new Error('No hay caja abierta');
+  if (b.efectivo_contado === undefined || b.efectivo_contado === '' || Number(b.efectivo_contado) < 0) throw new Error('Indica el efectivo contado');
+  const { esperado } = await estadoTurno(conn, t);
+  const contado = r2(b.efectivo_contado), dif = r2(contado - esperado);
+  await conn.query(
+    `UPDATE caja_turnos SET estado='cerrada', cierre_at=NOW(), efectivo_esperado=?, efectivo_contado=?, diferencia=?, notas=? WHERE id=?`,
+    [esperado, contado, dif, String(b.notas || '').slice(0, 255), t.id]);
+  if (Math.abs(dif) >= 0.01) await notificar(conn, eid, { rol: 'propietario', tipo: 'diferencia_caja',
+    titulo: 'Diferencia de caja', detalle: `Esperado ${fmtUSD(esperado)} · contado ${fmtUSD(contado)} · diferencia ${fmtUSD(dif)}`,
+    ref_tipo: 'caja', ref_id: t.id });
+  await audit(conn, req, 'cerrar', 'caja', t.id, { esperado, contado, dif });
+  return { esperado, contado, diferencia: dif };
+}, res));
+
+app.get('/api/egresos', verificarToken, cajaRol, ah(async (req, res) => {
+  const { desde, hasta } = await resolverRango(req);
+  const [rows] = await pool.query(
+    `SELECT e.*, u.nombre AS usuario_nombre FROM egresos e LEFT JOIN usuarios u ON u.id=e.usuario_id
+     WHERE e.empresa_id=? AND DATE(e.created_at) BETWEEN ? AND ? ORDER BY e.id DESC LIMIT 300`, [req.user.empresa_id, desde, hasta]);
+  const total = rows.filter(x => !x.anulado).reduce((a, x) => a + Number(x.monto), 0);
+  res.json({ ok: true, egresos: rows, total: r2(total) });
+}));
+
+app.post('/api/egresos', verificarToken, cajaRol, ah(async (req, res) => {
+  const b = req.body || {}, eid = req.user.empresa_id, monto = r2(b.monto);
+  if (!(monto > 0)) return res.status(400).json({ ok: false, error: 'Monto inválido' });
+  if (!CAT_EGRESO.includes(b.categoria)) return res.status(400).json({ ok: false, error: 'Categoría inválida' });
+  const metodo = METODOS.includes(b.metodo) ? b.metodo : 'efectivo';
+  const [t] = await pool.query(`SELECT id FROM caja_turnos WHERE empresa_id=? AND estado='abierta' LIMIT 1`, [eid]);
+  if (metodo === 'efectivo' && !t.length) return res.status(400).json({ ok: false, error: 'Abre la caja para registrar egresos en efectivo' });
+  const [r] = await pool.query(
+    `INSERT INTO egresos (empresa_id, turno_id, categoria, descripcion, monto, metodo, usuario_id) VALUES (?,?,?,?,?,?,?)`,
+    [eid, t[0]?.id || null, b.categoria, String(b.descripcion || '').slice(0, 160), monto, metodo, req.user.id]);
+  await audit(pool, req, 'crear', 'egreso', r.insertId, { monto, categoria: b.categoria });
+  res.json({ ok: true, id: r.insertId });
+}));
+
+// Los egresos no se borran: se anulan
+app.put('/api/egresos/:id/anular', verificarToken, cajaRol, ah(async (req, res) => {
+  const [r] = await pool.query(`UPDATE egresos SET anulado=1 WHERE id=? AND empresa_id=? AND anulado=0`, [req.params.id, req.user.empresa_id]);
+  if (!r.affectedRows) return res.status(404).json({ ok: false, error: 'Egreso no encontrado' });
+  await audit(pool, req, 'anular', 'egreso', req.params.id, {});
+  res.json({ ok: true });
+}));
+
+app.get('/api/vencimientos', verificarToken, requireRoles('propietario', 'recepcion', 'veterinario'), ah(async (req, res) => {
+  const dias = Math.min(Math.max(parseInt(req.query.dias) || 30, 1), 365);
+  const [rows] = await pool.query(
+    `SELECT l.id, l.numero_lote, l.cantidad, p.nombre, DATE_FORMAT(l.fecha_vencimiento,'%Y-%m-%d') AS vence,
+            DATEDIFF(l.fecha_vencimiento, CURDATE()) AS dias
+     FROM lotes l JOIN productos p ON p.id=l.producto_id
+     WHERE l.empresa_id=? AND l.cantidad>0 AND l.fecha_vencimiento IS NOT NULL
+       AND l.fecha_vencimiento <= DATE_ADD(CURDATE(), INTERVAL ? DAY)
+     ORDER BY l.fecha_vencimiento, p.nombre LIMIT 200`, [req.user.empresa_id, dias]);
+  res.json({ ok: true, lotes: rows });
 }));
 
 app.get('/api/resumen', verificarToken, requireRoles('propietario'), ah(async (req, res) => {
